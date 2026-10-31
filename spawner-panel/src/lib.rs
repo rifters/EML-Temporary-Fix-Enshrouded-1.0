@@ -1375,6 +1375,7 @@ impl eframe::App for App {
 pub fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+        // changed sizing for my needs
             .with_inner_size([853.0, 520.0])
             .with_min_inner_size([600.0, 400.0])
             .with_title(WINDOW_TITLE),
