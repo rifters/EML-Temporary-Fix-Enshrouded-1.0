@@ -1375,8 +1375,8 @@ impl eframe::App for App {
 pub fn native_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 780.0])
-            .with_min_inner_size([980.0, 600.0])
+            .with_inner_size([853.0, 520.0])
+            .with_min_inner_size([600.0, 400.0])
             .with_title(WINDOW_TITLE),
         ..Default::default()
     }
