@@ -2,7 +2,7 @@ use std::{borrow::Borrow, collections::HashMap, fs::File, io::{BufReader, Read, 
 
 use crate::{container::KFCReadError, guid::{ContentHash, ResourceId}};
 
-use super::{header::ResourceEntry, KFCFile};
+use super::{header::{ResourceChunkInfo, ResourceEntry}, KFCFile};
 
 /// Resource sizes are stored in 24 bits, so sizes of 16 MiB and larger are
 /// truncated to their lower 24 bits.
@@ -289,14 +289,7 @@ where
             None => {
                 let kfc_reader = self.kfc_reader.borrow();
 
-                if index >= kfc_reader.file.resource_chunks().len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "attempted to read resource chunk that is out of bounds"
-                    ));
-                }
-
-                let chunk = &kfc_reader.file.resource_chunks()[index];
+                let chunk = resource_chunk(&kfc_reader.file, index)?;
 
                 self.buffer.clear();
                 self.buffer.resize(chunk.compressed_size as usize, 0);
@@ -417,6 +410,15 @@ where
 
 }
 
+fn resource_chunk(file: &KFCFile, index: usize) -> std::io::Result<&ResourceChunkInfo> {
+    file.resource_chunks().get(index).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "attempted to read resource chunk that is out of bounds",
+        )
+    })
+}
+
 fn resource_bounds(file: &KFCFile) -> Vec<u64> {
     let mut bounds = file.resources()
         .values()
@@ -468,6 +470,23 @@ fn actual_resource_size(bounds: &[u64], entry: &ResourceEntry) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_chunk_rejects_out_of_bounds_index() {
+        assert!(resource_chunk(&KFCFile::default(), 0).is_err());
+
+        let mut file = KFCFile::default();
+        file.set_resource_chunks(vec![ResourceChunkInfo::default()]);
+
+        assert!(resource_chunk(&file, 0).is_ok());
+
+        let error = resource_chunk(&file, 1).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            error.to_string(),
+            "attempted to read resource chunk that is out of bounds",
+        );
+    }
 
     fn entry(offset: u64, size: u64) -> ResourceEntry {
         ResourceEntry { offset, size }

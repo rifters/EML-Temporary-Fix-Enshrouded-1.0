@@ -59,6 +59,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: eml-fork
+      - name: Test KFC chunk bounds check
+        working-directory: eml-fork
+        run: cargo test --locked -p kfc-base
       - name: Build
         working-directory: eml-fork
         run: cargo build --release --locked -p dbghelp-proxy
@@ -66,7 +69,7 @@ jobs:
         shell: bash
         run: |
           f=eml-fork/target/release/dbghelp.dll
-          for marker in "KFCWriter is no longer available" "Failed to apply resource" "M182 VFX" "attempted to read resource chunk that is out of bounds"; do
+          for marker in "KFCWriter is no longer available" "Failed to apply resource" "M182 VFX"; do
             grep -qa "$marker" "$f" || { echo "dbghelp.dll is missing marker: $marker"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
