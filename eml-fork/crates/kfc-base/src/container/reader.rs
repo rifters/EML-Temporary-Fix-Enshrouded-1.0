@@ -473,6 +473,8 @@ mod tests {
 
     #[test]
     fn resource_chunk_rejects_out_of_bounds_index() {
+        assert!(resource_chunk(&KFCFile::default(), 0).is_err());
+
         let mut file = KFCFile::default();
         file.set_resource_chunks(vec![ResourceChunkInfo::default()]);
 
