@@ -175,6 +175,10 @@ pub fn handle_with(session: &mut Session, now: Instant, text: &str, key: &str, c
     }
     let outcome = match command.as_str() {
         "ping" => Ok("ping".to_string()),
+        "mark" => {
+            super::diag::mark(rest);
+            Ok("mark".to_string())
+        }
         "set" => {
             let (file, body) = next_token(rest);
             let written = write_json(dir, file, body, client);

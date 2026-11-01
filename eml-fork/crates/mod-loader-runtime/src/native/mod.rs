@@ -8,6 +8,7 @@
 
 pub mod chat;
 pub mod config;
+pub mod diag;
 pub mod faction;
 pub mod groups;
 pub mod invites;

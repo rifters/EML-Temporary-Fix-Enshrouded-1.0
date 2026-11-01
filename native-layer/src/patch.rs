@@ -36,7 +36,19 @@ fn read_faction(ptr: *const u8) -> u8 {
 
 static TEAM_CHECKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+static ZONE_PAIRS: std::sync::Mutex<Vec<(u8, u8, bool)>> = std::sync::Mutex::new(Vec::new());
+
 fn team_check_report(a: u8, b: u8, hostile: bool, via: &str) {
+    if faction::zone_pvp() && matches!(a, 7 | 8 | 11) && matches!(b, 7 | 8 | 11) {
+        if let Ok(mut seen) = ZONE_PAIRS.lock() {
+            if !seen.contains(&(a, b, hostile)) && seen.len() < 40 {
+                seen.push((a, b, hostile));
+                let line = format!("pvp zones: relation check {via} {a} vs {b} -> {}", if hostile { "hostile" } else { "not hostile" });
+                super::spawner::log(&line);
+                super::diag::line(&line);
+            }
+        }
+    }
     let teams = faction::TEAM_FACTIONS;
     if (teams.contains(&a) || teams.contains(&b)) && faction::team_mask() != 0 && TEAM_CHECKS.fetch_add(1, Ordering::Relaxed) < 30 {
         super::spawner::log(&format!("teams: relation check {via} {a} vs {b} -> {}", if hostile { "hostile" } else { "not hostile" }));
@@ -45,7 +57,7 @@ fn team_check_report(a: u8, b: u8, hostile: bool, via: &str) {
 
 extern "win64" fn enemy_values(rcx: usize, rdx: usize) -> u8 {
     let (a, b) = (rcx as u8, rdx as u8);
-    let hostile = faction::enemy(a, b, LIVE.pvp());
+    let hostile = faction::enemy(a, b, faction::pvp_effective(LIVE.pvp()));
     team_check_report(a, b, hostile, "values");
     hostile as u8
 }
@@ -58,7 +70,7 @@ extern "win64" fn enemy_ptrs(a: *const u8, b: *const u8) -> u8 {
         }
         return 0;
     }
-    let hostile = faction::enemy(fa, fb, LIVE.pvp());
+    let hostile = faction::enemy(fa, fb, faction::pvp_effective(LIVE.pvp()));
     team_check_report(fa, fb, hostile, "pointers");
     hostile as u8
 }
@@ -145,13 +157,18 @@ pub fn restricted_permissions() -> u64 {
     PERMISSIONS_RESTRICTED.load(Ordering::SeqCst)
 }
 
-extern "win64" fn filter_permissions(entity: u32, permissions: u32) -> u32 {
+extern "win64" fn filter_permissions(entity: u32, permissions: u32, caller: usize) -> u32 {
     let bit = entity.wrapping_sub(1);
-    if bit < 64 && PERMISSIONS_RESTRICTED.load(Ordering::Relaxed) >> bit & 1 != 0 {
+    let shown = if bit < 64 && PERMISSIONS_RESTRICTED.load(Ordering::Relaxed) >> bit & 1 != 0 {
         super::roster::visitor_permissions(permissions as u8) as u32
     } else {
         permissions
+    };
+    if super::diag::on() {
+        let base = unsafe { GetModuleHandleW(std::ptr::null()) } as usize;
+        super::diag::permission(entity, permissions, shown, caller.wrapping_sub(base));
     }
+    shown
 }
 
 // Tail of the game's permission lookup: reads the stored byte, lets `filter_permissions` narrow it
@@ -175,6 +192,7 @@ unsafe extern "win64" fn stub_permissions() {
         "movups [rsp + 0x70], xmm5",
         "mov ecx, edx",
         "mov edx, eax",
+        "mov r8, [rsp + 0xb8]",
         "call {f}",
         "movups xmm0, [rsp + 0x20]",
         "movups xmm1, [rsp + 0x30]",

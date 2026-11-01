@@ -350,6 +350,11 @@ pub fn submit_friendly_fire(on: bool) {
     push(Job { file: "friendlyfire".to_string(), lines: vec![proto::friendly_fire(&key, on)], tries: 0, sum: None }, true);
 }
 
+pub fn submit_mark(text: &str) {
+    let key = state().settings.key.clone();
+    push(Job { file: "mark".to_string(), lines: vec![proto::mark(&key, text)], tries: 0, sum: None }, false);
+}
+
 pub fn submit_players(seq: u32) {
     let key = state().settings.key.clone();
     push(Job { file: "players".to_string(), lines: vec![proto::players(&key, seq)], tries: 0, sum: None }, true);

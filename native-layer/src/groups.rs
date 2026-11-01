@@ -23,11 +23,17 @@ pub struct Zone {
     pub lock: Option<bool>,
     /// Also restrict administrators (to try it out yourself).
     pub lock_admins: Option<bool>,
+    /// Players can always hurt each other inside, even when PvP is off for the rest of the world.
+    pub pvp: Option<bool>,
 }
 
 impl Zone {
     pub fn is_safe(&self) -> bool {
-        self.safe.unwrap_or(true)
+        self.safe.unwrap_or(true) && !self.is_pvp()
+    }
+
+    pub fn is_pvp(&self) -> bool {
+        self.pvp.unwrap_or(false)
     }
 
     pub fn owner(&self) -> u32 {
@@ -519,5 +525,12 @@ mod tests {
         assert!(!same_team(0x1000, 0x9000));
         assert!(!same_team(0, 0));
         set_team_map(Vec::new());
+    }
+
+    #[test]
+    fn pvp_zone_is_never_safe() {
+        let zones = parse_zones(r#"{"zones":[{"name":"Arena","x":0,"z":0,"radius":20,"pvp":true},{"name":"Town","x":100,"z":0,"radius":20}]}"#);
+        assert!(zones[0].is_pvp() && !zones[0].is_safe());
+        assert!(!zones[1].is_pvp() && zones[1].is_safe());
     }
 }

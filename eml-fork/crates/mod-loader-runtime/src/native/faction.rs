@@ -10,6 +10,25 @@ pub const PLAYER: u8 = 7;
 pub const TEAM_FACTIONS: [u8; 2] = [8, 11];
 
 static TEAM_MASK: AtomicU32 = AtomicU32::new(0);
+static ZONE_PVP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Faction lent to players outside the always-PvP zones while PvP is off elsewhere. It is a
+/// player-group faction that never counts as a hostile player pair.
+pub const PEACE: u8 = 8;
+
+/// At least one always-PvP zone exists and PvP is off for the rest of the world.
+pub fn set_zone_pvp(on: bool) {
+    ZONE_PVP.store(on, Ordering::Relaxed);
+}
+
+pub fn zone_pvp() -> bool {
+    ZONE_PVP.load(Ordering::Relaxed)
+}
+
+/// PvP as the faction hooks must see it: the global switch or the always-PvP zones.
+pub fn pvp_effective(global: bool) -> bool {
+    global || zone_pvp()
+}
 static FRIENDLY_FIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Members of the same team can hurt each other (off by default: teams protect their members).
@@ -251,5 +270,25 @@ mod tests {
         assert!(!enemy(8, PLAYER, true));
         // monsters still hostile to players
         assert!(enemy(4, PLAYER, true));
+    }
+
+    #[test]
+    fn zone_pvp_hurts_only_players_inside_the_zone() {
+        // inside: PLAYER vs PLAYER; outside: PEACE vs anyone
+        assert!(enemy_in(PLAYER, PLAYER, true, 0));
+        assert!(!enemy_in(PEACE, PLAYER, true, 0));
+        assert!(!enemy_in(PEACE, PEACE, true, 0));
+        assert!(!enemy_in(PLAYER, PEACE, true, 0));
+        // creatures stay hostile to both
+        assert!(enemy_in(1, PEACE, true, 0));
+        assert!(enemy_in(PEACE, 3, true, 0));
+    }
+
+    #[test]
+    fn zone_pvp_team_inside_does_not_hurt_itself() {
+        let mask = 1u32 << 11;
+        assert!(!enemy_in(11, 11, true, mask));
+        assert!(enemy_in(11, PLAYER, true, mask));
+        assert!(!enemy_in(PEACE, 11, true, mask));
     }
 }

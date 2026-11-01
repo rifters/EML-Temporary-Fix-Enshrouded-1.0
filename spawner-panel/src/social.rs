@@ -28,11 +28,13 @@ pub struct Zone {
     pub lock: bool,
     /// Also applies to administrators (to try it out).
     pub lock_admins: bool,
+    /// Players can always hurt each other inside, even when PvP is off elsewhere.
+    pub pvp: bool,
 }
 
 impl Zone {
     pub fn new(name: String, x: f64, z: f64, radius: f64) -> Self {
-        Self { name, x, z, radius, enabled: true, safe: true, team: 0, lock: false, lock_admins: false }
+        Self { name, x, z, radius, enabled: true, safe: true, team: 0, lock: false, lock_admins: false, pvp: false }
     }
 }
 
@@ -350,6 +352,7 @@ pub fn parse_zones(text: &str) -> Vec<Zone> {
                 team: v.get("team").and_then(|e| e.as_u64()).unwrap_or(0) as usize,
                 lock: v.get("lock").and_then(|e| e.as_bool()).unwrap_or(false),
                 lock_admins: v.get("lock_admins").and_then(|e| e.as_bool()).unwrap_or(false),
+                pvp: v.get("pvp").and_then(|e| e.as_bool()).unwrap_or(false),
             })
         })
         .collect()
@@ -357,7 +360,7 @@ pub fn parse_zones(text: &str) -> Vec<Zone> {
 
 pub fn zones_json(zones: &[Zone]) -> Value {
     json!({
-        "zones": zones.iter().map(|z| json!({"name": z.name, "x": z.x, "z": z.z, "radius": z.radius, "enabled": z.enabled, "safe": z.safe, "team": z.team, "lock": z.lock && z.team != 0, "lock_admins": z.lock_admins})).collect::<Vec<_>>()
+        "zones": zones.iter().map(|z| json!({"name": z.name, "x": z.x, "z": z.z, "radius": z.radius, "enabled": z.enabled, "safe": z.safe, "team": z.team, "lock": z.lock && z.team != 0, "lock_admins": z.lock_admins, "pvp": z.pvp})).collect::<Vec<_>>()
     })
 }
 
@@ -777,7 +780,15 @@ impl App {
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
-                        changed |= ui.checkbox(&mut z.safe, "Zona segura (nadie pierde vida)").changed();
+                        if ui.add_enabled(!z.pvp, egui::Checkbox::new(&mut z.safe, "Zona segura (nadie pierde vida)")).changed() {
+                            changed = true;
+                        }
+                        if ui.checkbox(&mut z.pvp, "PvP siempre activo aquí").on_hover_text("Dentro de esta zona los jugadores se pueden atacar entre sí aunque el PvP esté apagado en el resto del mundo. No puede ser zona segura.").changed() {
+                            if z.pvp {
+                                z.safe = false;
+                            }
+                            changed = true;
+                        }
                         ui.label("Equipo dueño");
                         let current = if z.team == 0 { "Nadie".to_string() } else { team_names.get(z.team - 1).cloned().unwrap_or_else(|| "—".to_string()) };
                         egui::ComboBox::from_id_salt(("zone_team", i)).selected_text(current).show_ui(ui, |ui| {
@@ -1199,6 +1210,17 @@ mod tests {
         let manual = manual_players();
         assert_eq!(manual[2].member.name, "ID 3");
         assert_eq!(manual[2].member.id_label(), "");
+    }
+
+    #[test]
+    fn pvp_zone_flag_is_saved_and_read_back() {
+        let mut arena = Zone::new("Arena".into(), 5.0, 6.0, 30.0);
+        arena.pvp = true;
+        arena.safe = false;
+        let text = zones_json(&[arena, Zone::new("Town".into(), 0.0, 0.0, 20.0)]).to_string();
+        let back = parse_zones(&text);
+        assert!(back[0].pvp && !back[0].safe);
+        assert!(!back[1].pvp && back[1].safe);
     }
 
     #[test]

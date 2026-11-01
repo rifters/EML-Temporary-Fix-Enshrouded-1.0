@@ -153,6 +153,7 @@ pub struct App {
     icons: HashMap<String, Option<TextureHandle>>,
     status: Status,
     notice: String,
+    diag_text: String,
     spawner_notice: String,
     creature_drops: Vec<spawners::Drop>,
     remote_cfg: remote::Settings,
@@ -565,6 +566,7 @@ impl App {
             icons: HashMap::new(),
             status: Status::Idle,
             notice: String::new(),
+            diag_text: String::new(),
             spawner_notice: String::new(),
             remote_cfg: remote_cfg.clone(),
             remote_notice: String::new(),
@@ -1331,6 +1333,41 @@ impl App {
         if !self.notice.is_empty() {
             ui.label(RichText::new(&self.notice).color(GOOD));
         }
+        ui.add_space(14.0);
+        divider(ui);
+        heading(ui, "Pruebas de diagnóstico", 18.0);
+        ui.label(RichText::new("Pulsa una marca justo antes de hacer esa acción en el juego. Así se encuentra en el registro m182_diag.log.").color(MUTED));
+        ui.horizontal_wrapped(|ui| {
+            for label in ["Construir fuera de zona", "Poner objeto", "Abrir puerta", "Abrir cofre", "Entrar en zona PvP", "Salir de zona PvP"] {
+                if button(ui, label, Vec2::new(190.0, 28.0), true, false) {
+                    self.mark_diag(label);
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.diag_text).desired_width(260.0).hint_text("Otra marca"));
+            if button(ui, "Marcar", Vec2::new(100.0, 28.0), !self.diag_text.trim().is_empty(), false) {
+                let text = std::mem::take(&mut self.diag_text);
+                self.mark_diag(&text);
+            }
+        });
+    }
+
+    fn mark_diag(&mut self, text: &str) {
+        if remote::active() {
+            remote::submit_mark(text);
+            self.notice = format!("Marca enviada al servidor: {text}");
+        } else {
+            use std::io::Write;
+            let path = self.dir.join("m182_diag.log");
+            self.notice = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(mut f) => match writeln!(f, "=== MARK {}", text.trim()) {
+                    Ok(()) => format!("Marca guardada: {text}"),
+                    Err(e) => format!("Error: {e}"),
+                },
+                Err(e) => format!("Error: {e}"),
+            };
+        }
     }
 }
 
@@ -1445,6 +1482,7 @@ mod tests {
             icons: HashMap::new(),
             status: Status::Idle,
             notice: String::new(),
+            diag_text: String::new(),
             spawner_notice: String::new(),
             remote_cfg: remote::read_settings(&std::env::temp_dir().join("m182_none")),
             remote_notice: String::new(),

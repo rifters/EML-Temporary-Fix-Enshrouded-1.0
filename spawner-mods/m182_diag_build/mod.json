@@ -1,0 +1,11 @@
+{
+    "id": "m182_diag_build",
+    "name": "M182 Build Test",
+    "description": "Test: build tools no longer require a build zone (flame altar). Install it on the server and on the admin's game.",
+    "version": "0.1.0",
+    "capabilities": ["patch"],
+    "dependencies": [],
+    "authors": ["M182"],
+    "license": null,
+    "icon": null
+}

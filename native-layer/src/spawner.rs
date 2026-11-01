@@ -2484,6 +2484,19 @@ fn team_factions(present: &[usize], pvp: bool) -> Vec<u8> {
     by_team
 }
 
+/// Factions for the teams inside always-PvP zones while PvP is off elsewhere: the first team with
+/// two or more people inside is protected from its own members; the faction left for outsiders
+/// (`PEACE`) is never lent to a team.
+fn zone_team_factions(present: &[usize]) -> Vec<u8> {
+    let mut by_team: Vec<u8> = vec![super::faction::PLAYER; present.len()];
+    if let Some(index) = present.iter().position(|n| *n >= 2) {
+        by_team[index] = super::faction::TEAM_FACTIONS[1];
+    }
+    by_team
+}
+
+static PVP_ZONE_STATE: Mutex<String> = Mutex::new(String::new());
+
 static NO_FACTION: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 fn note_faction(id: u32, missing: bool) {
@@ -2560,15 +2573,38 @@ fn groups_tick(st: &mut PowerState, dir: &std::path::Path) {
             Seen { id: *id, number: *number, name, team }
         })
         .collect();
+    let pvp_zones: Vec<groups::Zone> = st.groups.zones.iter().filter(|z| z.is_pvp()).cloned().collect();
+    let zone_mode = !LIVE.pvp() && !pvp_zones.is_empty();
+    let in_pvp: Vec<bool> = seen
+        .iter()
+        .map(|p| {
+            zone_mode
+                && transform_of(manager, p.id)
+                    .map(|t| groups::inside(&pvp_zones, le_i64(&t, 0) as f64 / METERS, le_i64(&t, 16) as f64 / METERS))
+                    .unwrap_or(false)
+        })
+        .collect();
     let mut present = vec![0usize; st.groups.teams.len()];
-    for p in &seen {
-        if p.team != 0 {
+    for (index, p) in seen.iter().enumerate() {
+        if p.team != 0 && (!zone_mode || in_pvp[index]) {
             if let Some(c) = present.get_mut(p.team as usize - 1) {
                 *c += 1;
             }
         }
     }
-    let lent = team_factions(&present, LIVE.pvp());
+    let lent = if zone_mode { zone_team_factions(&present) } else { team_factions(&present, LIVE.pvp()) };
+    super::faction::set_zone_pvp(zone_mode);
+    {
+        let inside: Vec<u32> = seen.iter().enumerate().filter(|(i, _)| in_pvp[*i]).map(|(_, p)| p.id).collect();
+        let state = format!("pvp zones={} zone_mode={} inside={:?}", pvp_zones.len(), zone_mode, inside);
+        if let Ok(mut last) = PVP_ZONE_STATE.lock() {
+            if *last != state {
+                log(&format!("zones: {state}"));
+                super::diag::line(&format!("zones: {state}"));
+                *last = state;
+            }
+        }
+    }
     let mut mask = 0u32;
     let mut rows = Vec::new();
     let mut map: Vec<(usize, u8)> = Vec::new();
@@ -2577,7 +2613,7 @@ fn groups_tick(st: &mut PowerState, dir: &std::path::Path) {
     let mut inside_ids: Vec<u32> = Vec::new();
     let mut inside_at: Vec<(u32, i64, i64, i64)> = Vec::new();
     let mut visitors: Vec<usize> = Vec::new();
-    for p in &seen {
+    for (seen_index, p) in seen.iter().enumerate() {
         let (id, number, team) = (p.id, p.number, p.team);
         match transform_of(manager, id) {
             Some(t) => {
@@ -2609,7 +2645,8 @@ fn groups_tick(st: &mut PowerState, dir: &std::path::Path) {
                         }
                     }
                 }
-                let wanted = if team != 0 { lent.get(team as usize - 1).copied().unwrap_or(super::faction::PLAYER) } else { super::faction::PLAYER };
+                let team_faction = if team != 0 { lent.get(team as usize - 1).copied().unwrap_or(super::faction::PLAYER) } else { super::faction::PLAYER };
+                let wanted = if zone_mode && !in_pvp[seen_index] { super::faction::PEACE } else { team_faction };
                 let addresses = faction_addresses(manager, id);
                 note_faction(id, team != 0 && addresses.is_empty());
                 for addr in addresses {
@@ -2617,7 +2654,7 @@ fn groups_tick(st: &mut PowerState, dir: &std::path::Path) {
                         map.push((addr, team));
                     }
                     if lend_faction(addr, wanted) {
-                        if wanted != super::faction::PLAYER {
+                        if wanted != super::faction::PLAYER && wanted != super::faction::PEACE {
                             mask |= 1u32 << wanted;
                         }
                     } else {
