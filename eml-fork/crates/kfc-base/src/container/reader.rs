@@ -288,6 +288,14 @@ where
             Some(_) => Ok(()),
             None => {
                 let kfc_reader = self.kfc_reader.borrow();
+
+                if index >= kfc_reader.file.resource_chunks().len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "attempted to read resource chunk that is out of bounds"
+                    ));
+                }
+
                 let chunk = &kfc_reader.file.resource_chunks()[index];
 
                 self.buffer.clear();
