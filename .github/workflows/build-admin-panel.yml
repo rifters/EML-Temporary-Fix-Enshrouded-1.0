@@ -66,7 +66,7 @@ jobs:
         shell: bash
         run: |
           f=eml-fork/target/release/dbghelp.dll
-          for marker in "KFCWriter is no longer available" "Failed to apply resource" "M182 VFX"; do
+          for marker in "KFCWriter is no longer available" "Failed to apply resource" "M182 VFX" "attempted to read resource chunk that is out of bounds"; do
             grep -qa "$marker" "$f" || { echo "dbghelp.dll is missing marker: $marker"; exit 1; }
           done
       - uses: actions/upload-artifact@v4
