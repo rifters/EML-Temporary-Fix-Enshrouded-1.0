@@ -430,8 +430,15 @@ where
         // stream now: at finalize time the stream file (which is also
         // the output file) is rewritten from the start, so nothing may
         // be read from it lazily later.
+        //
+        // The snapshot requires the live stream to match the reference
+        // directory. When the loader runs from the .bak reference (the
+        // already-patched flow), the reference describes the pre-patch
+        // directory while the stream on disk is the previous export, so
+        // the snapshot cannot be taken. Fall back to incremental writing
+        // for this run instead of failing writer creation.
         let inplace_data = if options.in_place {
-            Some(InPlaceData::load(reference_file.borrow(), &resources_path)?)
+            InPlaceData::load(reference_file.borrow(), &resources_path).ok()
         } else {
             None
         };
