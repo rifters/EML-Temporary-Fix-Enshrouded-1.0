@@ -79,6 +79,21 @@ pub fn create_writer(
     Ok(writer)
 }
 
+/// The resources stream that pairs with a .kfc file, and that stream's
+/// own backup path. Backups are pairs: the .kfc directory and the stream
+/// only describe the same generation together, so one is never backed up
+/// or restored without the other.
+fn resources_path(kfc_path: &Path) -> PathBuf {
+    kfc_path.with_extension("kfc_resources")
+}
+
+fn resources_bak_path(kfc_path: &Path) -> PathBuf {
+    let resources = resources_path(kfc_path);
+    let mut bak_path = resources.to_string();
+    bak_path.push_str(".bak");
+    Path::new(&bak_path).to_path_buf()
+}
+
 pub fn create_backup(
     kfc_path: impl AsRef<Path>
 ) -> Result<PathBuf, ()> {
@@ -112,6 +127,8 @@ pub fn create_backup(
         }
     }
 
+    let mut kfc_bak_created = false;
+
     if !bak_path.exists() {
         if let Err(e) = std::fs::copy(path, bak_path) {
             error!(
@@ -125,6 +142,37 @@ pub fn create_backup(
             info!(
                 path = ?bak_path,
                 "Backup file created successfully",
+            );
+
+            kfc_bak_created = true;
+        }
+    }
+
+    // Back the resources stream up alongside the .kfc whenever the .kfc
+    // backup is (re)created, or when the stream backup is missing (first
+    // run after this pairing was introduced). A kept .kfc backup with an
+    // existing stream backup is left untouched: at that point the live
+    // stream is a later export and copying it would poison the pair.
+    let resources = resources_path(path);
+    let res_bak_path = resources_bak_path(path);
+
+    if resources.is_file() && (kfc_bak_created || !res_bak_path.exists()) {
+        if let Err(e) = std::fs::copy(&resources, &res_bak_path) {
+            error!(
+                path = ?res_bak_path,
+                error = %e,
+                "Failed to create resource backup file",
+            );
+
+            // Never leave a partial stream backup behind; a later
+            // restore would happily install the truncated half.
+            let _ = std::fs::remove_file(&res_bak_path);
+
+            return Err(());
+        } else {
+            info!(
+                path = ?res_bak_path,
+                "Resource backup file created successfully",
             );
         }
     }
@@ -179,6 +227,31 @@ pub fn restore_backup(
             backup_path = ?bak_path,
             "Backup file restored successfully",
         );
+    }
+
+    // Restore the resources half of the pair as well, when one was backed
+    // up. Restoring only the .kfc leaves a directory pointing into a
+    // stream from another generation, which the game refuses to load.
+    let res_bak_path = resources_bak_path(path);
+
+    if res_bak_path.is_file() {
+        let resources = resources_path(path);
+
+        if let Err(e) = std::fs::copy(&res_bak_path, &resources) {
+            error!(
+                path = ?resources,
+                backup_path = ?res_bak_path,
+                error = %e,
+                "Failed to restore resource backup file",
+            );
+            return Err(());
+        } else {
+            info!(
+                path = ?resources,
+                backup_path = ?res_bak_path,
+                "Resource backup file restored successfully",
+            );
+        }
     }
 
     Ok(())
