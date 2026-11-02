@@ -123,6 +123,26 @@ impl AppState {
             .with_extension("kfc");
         let bak_path = crate::load::create_backup(&kfc_path)?;
 
+        if options.patch {
+            // A patch pass rebuilds the live files from the backup
+            // reference, and the writers assume the stream on disk is
+            // still the reference stream with new data appended - true
+            // while exports were append-only. The in-place writer
+            // rewrites the stream in place, so after an in-place export
+            // the live pair is a different generation than the backup
+            // pair, and a re-patch over it writes one generation's
+            // directory over another generation's stream (the game then
+            // refuses the pair). Restore the pair first so the reference
+            // and the disk agree; the patch outcome is unchanged, since
+            // the working state already comes from the backup alone.
+            let live_kfc = std::fs::read(&kfc_path).unwrap_or_default();
+            let bak_kfc = std::fs::read(&bak_path).unwrap_or_default();
+
+            if live_kfc != bak_kfc {
+                crate::load::restore_backup(&kfc_path)?;
+            }
+        }
+
         let ref_file = crate::load::load_kfc_file(&bak_path)?;
         let reader = crate::load::create_reader(game_dir, file_name)?;
         let writer = crate::load::create_writer(game_dir, file_name, &type_registry, &ref_file)?;
