@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, collections::HashMap, fs::File, io::{BufWriter, Cursor, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
+use std::{borrow::Borrow, collections::HashMap, fs::File, io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
 
 use crate::{Hash32, container::header::ResourceChunkInfo, guid::{ContentHash, ResourceId}, io::{WriteExt, WriteSeekExt}, reflection::TypeRegistry};
 
@@ -30,11 +30,223 @@ pub struct KFCWriter<F, T> {
     contents: StaticMapBuilder<ContentHash, ContentEntry>,
 
     incremental_data: Option<IncrementalData<F>>,
+    inplace_data: Option<InPlaceData>,
     options: KFCWriteOptions,
 }
 
 struct IncrementalData<F> {
     reference_file: F,
+}
+
+/// The zstd level used for chunks that have no reference counterpart
+/// (appended data) and as a fallback for changed chunks whose reference
+/// level could not be detected. 9 is the game's main-pass level: on the
+/// build-1273043 container it reproduces 61 of 66 reference frames (the
+/// remaining five are tail chunks at level 3, and three empty chunks
+/// match several levels including 9).
+const INPLACE_FALLBACK_LEVEL: i32 = 9;
+
+/// Candidate levels for in-place level detection, in the order they are
+/// tried. The levels observed in game files (9, 3, 1) come first.
+const INPLACE_LEVEL_CANDIDATES: [i32; 19] = [
+    9, 3, 1, 2, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+];
+
+/// Everything the in-place writer mode snapshots from the reference
+/// file at construction time. The output stream file is the reference
+/// stream file itself, rewritten from the start at finalize, so no
+/// reference data may be read lazily after construction.
+struct InPlaceData {
+    /// Decompressed working copy of the reference stream, with all
+    /// edits spliced in and appended data at the end. Its length is
+    /// always `append_offset`.
+    stream: Vec<u8>,
+    /// The reference file's chunk table; output chunks preserve this
+    /// uncompressed geometry.
+    reference_chunks: Vec<ResourceChunkInfo>,
+    /// The detected zstd level per reference chunk, or `None` where no
+    /// candidate level reproduced the chunk's original frame.
+    chunk_levels: Vec<Option<i32>>,
+    /// The original compressed frame of every chunk whose level could
+    /// not be detected, kept so an unchanged chunk can still be written
+    /// out byte-identically. `None` where a level was detected.
+    fallback_frames: Vec<Option<Vec<u8>>>,
+    /// Per reference chunk: whether any edit touched its byte range.
+    dirty_chunks: Vec<bool>,
+    /// The current allocation of every resource this writer knows:
+    /// `offset` is where its data lives in `stream`, `size` is the span
+    /// a rewrite may occupy at that offset. Reference resources start
+    /// with their original span (stored sizes recovered from the 24-bit
+    /// truncation, mirroring `KFCReader::resource_size`); appended
+    /// resources with the span they were appended with.
+    allocations: HashMap<ResourceId, ResourceEntry>,
+    /// The offset at which the next appended resource is placed:
+    /// the end of the reference stream, then the end of the appended
+    /// region. Always 16-aligned.
+    append_offset: u64,
+}
+
+impl InPlaceData {
+
+    fn load(reference: &KFCFile, resources_path: &Path) -> Result<Self, KFCReadError> {
+        let reference_chunks = reference.resource_chunks().to_vec();
+
+        let uncompressed_size = reference_chunks.iter()
+            .map(|chunk| chunk.uncompressed_offset + chunk.uncompressed_size)
+            .max()
+            .unwrap_or(0);
+
+        // read and decompress the whole reference stream, detecting each
+        // chunk's zstd level by re-encoding its data and comparing the
+        // result against the chunk's original frame
+
+        let mut stream = vec![0u8; uncompressed_size as usize];
+        let mut chunk_levels = Vec::with_capacity(reference_chunks.len());
+        let mut fallback_frames = Vec::with_capacity(reference_chunks.len());
+
+        let mut reader = BufReader::new(File::open(resources_path)?);
+        let mut frame = Vec::new();
+
+        for chunk in &reference_chunks {
+            frame.clear();
+            frame.resize(chunk.compressed_size as usize, 0);
+
+            reader.seek(SeekFrom::Start(chunk.offset))?;
+            reader.read_exact(&mut frame[..chunk.compressed_size as usize])?;
+
+            let mut data = Vec::with_capacity(chunk.uncompressed_size as usize);
+            zstd::stream::copy_decode(&mut &frame[..], &mut data)?;
+
+            if data.len() as u64 != chunk.uncompressed_size {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "reference chunk at offset {} decompressed to {} bytes, expected {}",
+                        chunk.offset,
+                        data.len(),
+                        chunk.uncompressed_size
+                    ),
+                ).into());
+            }
+
+            let start = chunk.uncompressed_offset as usize;
+            stream[start..start + data.len()].copy_from_slice(&data);
+
+            let mut detected = None;
+
+            for level in INPLACE_LEVEL_CANDIDATES {
+                if encode_chunk(&data, level)? == frame[..] {
+                    detected = Some(level);
+                    break;
+                }
+            }
+
+            fallback_frames.push(if detected.is_none() {
+                Some(frame.clone())
+            } else {
+                None
+            });
+            chunk_levels.push(detected);
+        }
+
+        // recover the original span of every reference resource (the
+        // stored sizes of resources >= 16 MiB are truncated to 24 bits)
+
+        let bounds = resource_bounds(reference);
+
+        let mut allocations = HashMap::with_capacity(reference.resources().len());
+
+        for (guid, entry) in reference.resources().iter() {
+            allocations.insert(*guid, ResourceEntry {
+                offset: entry.offset,
+                size: actual_resource_size(&bounds, entry),
+            });
+        }
+
+        let chunk_count = reference_chunks.len();
+
+        Ok(Self {
+            stream,
+            reference_chunks,
+            chunk_levels,
+            fallback_frames,
+            dirty_chunks: vec![false; chunk_count],
+            allocations,
+            append_offset: uncompressed_size,
+        })
+    }
+
+    fn mark_dirty(&mut self, start: u64, end: u64) {
+        for (index, chunk) in self.reference_chunks.iter().enumerate() {
+            let chunk_start = chunk.uncompressed_offset;
+            let chunk_end = chunk_start + chunk.uncompressed_size;
+
+            if chunk_start < end && start < chunk_end {
+                self.dirty_chunks[index] = true;
+            }
+        }
+    }
+
+}
+
+/// Compresses one chunk the same way the writer's chunk submission
+/// does (`zstd::stream::copy_encode`), at an explicit level.
+fn encode_chunk(data: &[u8], level: i32) -> std::io::Result<Vec<u8>> {
+    let mut encoded = Vec::new();
+    zstd::stream::copy_encode(&mut &data[..], &mut encoded, level)?;
+    Ok(encoded)
+}
+
+/// Sorted, distinct resource offsets followed by the end of the
+/// resource data. Mirrors `KFCReader`'s bounds computation.
+fn resource_bounds(file: &KFCFile) -> Vec<u64> {
+    let mut bounds = file.resources()
+        .values()
+        .iter()
+        .map(|entry| entry.offset)
+        .collect::<Vec<_>>();
+
+    let data_end = file.resource_chunks()
+        .iter()
+        .map(|chunk| chunk.uncompressed_offset + chunk.uncompressed_size)
+        .max()
+        .unwrap_or(0);
+
+    bounds.sort_unstable();
+    bounds.dedup();
+    bounds.push(data_end);
+    bounds
+}
+
+/// The actual size of a resource whose stored size may have been
+/// truncated to 24 bits. Mirrors the reader's recovery rule
+/// (`actual_resource_size` in `reader.rs`): the space up to the next
+/// resource must match the stored size plus a multiple of 16 MiB and
+/// less than the resource alignment, otherwise the stored size is used
+/// as is.
+fn actual_resource_size(bounds: &[u64], entry: &ResourceEntry) -> u64 {
+    const RESOURCE_SIZE_MODULUS: u64 = 0x1000000;
+
+    let next = match bounds.binary_search(&entry.offset) {
+        Ok(index) => bounds.get(index + 1),
+        Err(index) => bounds.get(index),
+    };
+
+    let Some(&next) = next else {
+        return entry.size;
+    };
+
+    let Some(gap) = next.checked_sub(entry.offset + entry.size) else {
+        return entry.size;
+    };
+
+    let missing = gap - gap % RESOURCE_SIZE_MODULUS;
+
+    if missing > 0 && gap - missing < RESOURCE_ALIGNMENT {
+        entry.size + missing
+    } else {
+        entry.size
+    }
 }
 
 #[derive(Debug)]
@@ -56,6 +268,15 @@ pub struct KFCWriteOptions {
     /// This is used to remove any leftover data from previous writes.
     /// **NOTE:** For incremental writes, this will only affect non-default .dat files.
     pub truncate_containers: bool,
+    /// If true, an incremental writer replaces resource data **in place**
+    /// within the reference stream whenever the new data fits the
+    /// resource's original allocation, instead of appending every written
+    /// resource after the reference stream. A resource whose new data
+    /// does not fit its allocation, and every brand-new resource, is
+    /// appended after the reference stream's end. Chunk geometry and
+    /// uncompressed offsets of everything else stay untouched.
+    /// **NOTE:** Only affects incremental writes; ignored otherwise.
+    pub in_place: bool,
 }
 
 impl Default for KFCWriteOptions {
@@ -67,6 +288,7 @@ impl Default for KFCWriteOptions {
             overwrite_containers: false,
             max_container_size: 1024 * 1024 * 1024, // 1 GiB
             truncate_containers: false,
+            in_place: false,
         }
     }
 }
@@ -136,6 +358,7 @@ where
             contents: StaticMapBuilder::default(),
 
             incremental_data: None,
+            inplace_data: None,
             options,
         })
     }
@@ -203,6 +426,16 @@ where
 
         resource_writer.seek(SeekFrom::Start(previous_resource_size))?;
 
+        // In-place mode snapshots everything it needs from the reference
+        // stream now: at finalize time the stream file (which is also
+        // the output file) is rewritten from the start, so nothing may
+        // be read from it lazily later.
+        let inplace_data = if options.in_place {
+            Some(InPlaceData::load(reference_file.borrow(), &resources_path)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             type_registry,
 
@@ -225,6 +458,7 @@ where
             incremental_data: Some(IncrementalData {
                 reference_file,
             }),
+            inplace_data,
             options,
         })
     }
@@ -250,6 +484,10 @@ where
         guid: &ResourceId,
         mut bytes: &[u8]
     ) -> std::io::Result<()> {
+        if self.inplace_data.is_some() {
+            return self.write_resource_inplace(guid, bytes);
+        }
+
         self.resources.insert(*guid, ResourceEntry {
             offset: self.uncompressed_offset,
             size: bytes.len() as u64
@@ -332,6 +570,172 @@ where
         Ok(())
     }
 
+    /// In-place variant of [`KFCWriter::write_resource`]: splices the new
+    /// data into the working copy of the reference stream at the
+    /// resource's original offset when it fits the resource's allocation
+    /// (the remainder of the allocation is zeroed, matching the format's
+    /// zero-gap convention); otherwise — and for brand-new resources —
+    /// appends the data after the reference stream's end. The directory
+    /// entry is updated either way; the stream itself is only written
+    /// out at `finalize`.
+    fn write_resource_inplace(
+        &mut self,
+        guid: &ResourceId,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        let data = self.inplace_data.as_mut()
+            .expect("write_resource_inplace called without in-place data");
+        let new_size = bytes.len() as u64;
+
+        match data.allocations.get(guid).cloned() {
+            Some(allocation) if new_size <= allocation.size => {
+                let start = allocation.offset as usize;
+                let end = (allocation.offset + allocation.size) as usize;
+
+                data.stream[start..start + bytes.len()].copy_from_slice(bytes);
+                data.stream[start + bytes.len()..end].fill(0);
+                data.mark_dirty(allocation.offset, allocation.offset + allocation.size);
+
+                self.resources.insert(*guid, ResourceEntry {
+                    offset: allocation.offset,
+                    size: new_size,
+                });
+            }
+            _ => {
+                let offset = data.append_offset;
+                let aligned_size = new_size
+                    + (RESOURCE_ALIGNMENT - (new_size % RESOURCE_ALIGNMENT)) % RESOURCE_ALIGNMENT;
+
+                debug_assert_eq!(data.stream.len() as u64, offset);
+                data.stream.extend_from_slice(bytes);
+                data.stream.resize((offset + aligned_size) as usize, 0);
+                data.append_offset = offset + aligned_size;
+
+                // The appended span (data + its alignment padding)
+                // becomes the resource's allocation for any later
+                // rewrite within this session. Its previous span, if
+                // any, stays behind as unreferenced data — the same
+                // orphan pattern the game's own files exhibit.
+                data.allocations.insert(*guid, ResourceEntry {
+                    offset,
+                    size: aligned_size,
+                });
+
+                self.resources.insert(*guid, ResourceEntry {
+                    offset,
+                    size: new_size,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Writes the in-place stream built from the reference's decompressed
+    /// data plus all edits, and returns the new chunk table.
+    ///
+    /// Reference chunks keep their uncompressed geometry and are encoded
+    /// at their own detected zstd level, so a chunk whose content did not
+    /// change reproduces its original frame byte for byte. When a changed
+    /// chunk's new frame still fits the chunk's original slot, the slot
+    /// size is kept as well and no later chunk moves; otherwise the slot
+    /// grows to the next 4096 alignment, as in the append path. Appended
+    /// data (relocated and brand-new resources) is chunked at
+    /// `RESOURCE_CHUNK_SIZE` and encoded at `INPLACE_FALLBACK_LEVEL`.
+    fn flush_inplace_stream(&mut self) -> std::io::Result<Vec<ResourceChunkInfo>> {
+        let data = self.inplace_data.take()
+            .expect("flush_inplace_stream called without in-place data");
+
+        let reference_end = data.reference_chunks.iter()
+            .map(|chunk| chunk.uncompressed_offset + chunk.uncompressed_size)
+            .max()
+            .unwrap_or(0);
+        debug_assert_eq!(data.stream.len() as u64, data.append_offset);
+        debug_assert!(data.append_offset >= reference_end);
+
+        let mut chunks: Vec<ResourceChunkInfo> = Vec::new();
+
+        self.resource_writer.seek(SeekFrom::Start(0))?;
+        let mut write_offset = 0u64;
+
+        for (index, reference) in data.reference_chunks.iter().enumerate() {
+            let start = reference.uncompressed_offset as usize;
+            let slice = &data.stream[start..start + reference.uncompressed_size as usize];
+
+            let frame = if !data.dirty_chunks[index] {
+                match &data.fallback_frames[index] {
+                    // No level reproduced this chunk's frame; reuse the
+                    // original frame bytes verbatim.
+                    Some(frame) => frame.clone(),
+                    None => encode_chunk(
+                        slice,
+                        data.chunk_levels[index]
+                            .expect("clean chunk without fallback frame has a detected level"),
+                    )?,
+                }
+            } else {
+                // A changed chunk whose level could not be detected is
+                // encoded at the fallback level; its content stays
+                // correct, only the frame bytes differ from what the
+                // reference's encoder would have produced.
+                encode_chunk(slice, data.chunk_levels[index].unwrap_or(INPLACE_FALLBACK_LEVEL))?
+            };
+
+            let compressed_size = frame.len() as u64;
+            let size = if compressed_size <= reference.size {
+                reference.size
+            } else {
+                compressed_size
+                    + (RESOURCE_CHUNK_ALIGNMENT - (compressed_size % RESOURCE_CHUNK_ALIGNMENT))
+                        % RESOURCE_CHUNK_ALIGNMENT
+            };
+
+            self.resource_writer.write_all(&frame)?;
+            self.resource_writer.padding(size - compressed_size)?;
+
+            chunks.push(ResourceChunkInfo {
+                offset: write_offset,
+                size,
+                compressed_size,
+                uncompressed_offset: reference.uncompressed_offset,
+                uncompressed_size: reference.uncompressed_size,
+            });
+            write_offset += size;
+        }
+
+        // appended region: fresh chunks after the reference stream's end
+        let mut uncompressed_offset = reference_end;
+        while uncompressed_offset < data.append_offset {
+            let uncompressed_size = RESOURCE_CHUNK_SIZE.min(data.append_offset - uncompressed_offset);
+            let start = uncompressed_offset as usize;
+            let slice = &data.stream[start..start + uncompressed_size as usize];
+
+            let frame = encode_chunk(slice, INPLACE_FALLBACK_LEVEL)?;
+            let compressed_size = frame.len() as u64;
+            let size = compressed_size
+                + (RESOURCE_CHUNK_ALIGNMENT - (compressed_size % RESOURCE_CHUNK_ALIGNMENT))
+                    % RESOURCE_CHUNK_ALIGNMENT;
+
+            self.resource_writer.write_all(&frame)?;
+            self.resource_writer.padding(size - compressed_size)?;
+
+            chunks.push(ResourceChunkInfo {
+                offset: write_offset,
+                size,
+                compressed_size,
+                uncompressed_offset,
+                uncompressed_size,
+            });
+            write_offset += size;
+            uncompressed_offset += uncompressed_size;
+        }
+
+        self.resource_writer.flush()?;
+        self.resource_writer.get_mut().set_len(write_offset)?;
+
+        Ok(chunks)
+    }
+
     pub fn write_content(
         &mut self,
         guid: &ContentHash,
@@ -361,12 +765,21 @@ where
     }
 
     pub fn finalize(mut self) -> Result<(), KFCWriteError> {
-        // Only submit a trailing chunk when resource data is actually
-        // pending. Submitting unconditionally would append an empty chunk
-        // (and grow the resources stream) even for a zero-change write.
-        if !self.chunk_writer.get_ref().is_empty() {
-            self.submit_resource_data()?;
-        }
+        // In-place mode builds the whole resources stream at finalize
+        // (see `flush_inplace_stream`) and reports its own chunk table;
+        // the append path submits its pending chunk buffer instead.
+        let inplace_chunks = if self.inplace_data.is_some() {
+            Some(self.flush_inplace_stream()?)
+        } else {
+            // Only submit a trailing chunk when resource data is actually
+            // pending. Submitting unconditionally would append an empty chunk
+            // (and grow the resources stream) even for a zero-change write.
+            if !self.chunk_writer.get_ref().is_empty() {
+                self.submit_resource_data()?;
+            }
+
+            None
+        };
 
         // prepare container infos
 
@@ -406,11 +819,17 @@ where
 
         // prepare resource chunks
 
-        let mut chunks = self.incremental_data.as_ref()
-            .map(|data| data.reference_file.borrow().resource_chunks().to_vec())
-            .unwrap_or_default();
+        let chunks = match inplace_chunks {
+            Some(chunks) => chunks,
+            None => {
+                let mut chunks = self.incremental_data.as_ref()
+                    .map(|data| data.reference_file.borrow().resource_chunks().to_vec())
+                    .unwrap_or_default();
 
-        chunks.extend(self.resource_chunks.iter().cloned());
+                chunks.extend(self.resource_chunks.iter().cloned());
+                chunks
+            }
+        };
 
         // header construction
 
