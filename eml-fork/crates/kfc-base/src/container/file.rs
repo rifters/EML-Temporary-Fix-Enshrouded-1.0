@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -12,7 +12,7 @@ use crate::{
     reflection::{LookupKey, TypeRegistry},
 };
 
-use super::{KFCReadError, KFCWriteError, StaticMap, StaticMapBucket, header::*};
+use super::{KFCReadError, KFCWriteError, StaticMap, StaticMapBucket, StaticMapBuilder, header::*};
 
 #[derive(Debug, Clone)]
 pub struct KFCFile {
@@ -149,7 +149,32 @@ impl KFCFile {
     ) -> Result<(), KFCWriteError> {
         self.resources = resources;
         self.resource_locations[0].count = self.resources.len();
-        self.rebuild_resource_bundles(type_registry, internal_hash_fallback)
+        self.rebuild_resource_bundles(type_registry, internal_hash_fallback, None)
+    }
+
+    /// Like [`KFCFile::set_resources`], but preserves the bundle layout of
+    /// a previous version of this file wherever possible:
+    ///
+    /// - If the resource key sequence is unchanged, the previous file's
+    ///   `resource_indices` and bundle map are carried over verbatim, so a
+    ///   zero-change write reproduces the loaded layout byte for byte.
+    /// - Otherwise, types that already existed keep the relative order of
+    ///   their previous bundle entries, and types that are new are appended
+    ///   afterwards, ascending by type hash. Indices are then reassigned as
+    ///   running offsets in that group order.
+    pub fn set_resources_preserving_bundles(
+        &mut self,
+        resources: StaticMap<ResourceId, ResourceEntry>,
+        type_registry: &TypeRegistry,
+        previous: &KFCFile,
+    ) -> Result<(), KFCWriteError> {
+        self.resources = resources;
+        self.resource_locations[0].count = self.resources.len();
+        self.rebuild_resource_bundles(
+            type_registry,
+            Some(previous.resource_bundles()),
+            Some(previous),
+        )
     }
 
     pub fn set_resource_chunks(
@@ -187,52 +212,90 @@ impl KFCFile {
         &mut self,
         type_registry: &TypeRegistry,
         internal_hash_fallback: Option<&StaticMap<Hash32, ResourceBundleEntry>>,
+        previous: Option<&KFCFile>,
     ) -> Result<(), KFCWriteError> {
-        let mut type_hashes = self
-            .resources
-            .keys()
-            .iter()
-            .map(|guid| guid.type_hash())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .map(|hash| {
-                let internal_hash = type_registry.get_by_hash(LookupKey::Qualified(hash))
-                    .map(|info| info.internal_hash)
-                    .or_else(|| internal_hash_fallback
-                        .and_then(|map| map.get(&hash))
-                        .map(|entry| entry.internal_hash))
-                    .ok_or(KFCWriteError::UnknownTypeHash(hash))?;
+        // Fast path: the resource key sequence is unchanged, so the
+        // previous file's bundle layout is still exact. Carry it over
+        // verbatim instead of recomputing it.
+        if let Some(previous) = previous {
+            if previous.resources.keys() == self.resources.keys()
+                && previous.resource_indices.len() == self.resources.len()
+            {
+                self.resource_indices = previous.resource_indices.clone();
+                self.resource_bundles = previous.resource_bundles.clone();
+                return Ok(());
+            }
+        }
 
-                Ok((
-                    hash,
-                    ResourceBundleEntry {
-                        internal_hash,
-                        ..Default::default()
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>, KFCWriteError>>()?;
+        // Group the positions of the resources by type hash. Within one
+        // group the positions follow the resource key order.
+        let mut groups: Vec<(Hash32, Vec<u32>)> = Vec::new();
+        let mut group_positions: HashMap<Hash32, usize> = HashMap::new();
 
-        let mut indices = Vec::with_capacity(self.resources.len());
+        for (i, (guid, _)) in self.resources.iter().enumerate() {
+            let hash = guid.type_hash();
 
-        for (hash, info) in type_hashes.iter_mut() {
-            info.index = indices.len();
-
-            let hash = *hash;
-            let mut count = 0;
-
-            for (i, (guid, _)) in self.resources.iter().enumerate() {
-                if guid.type_hash() == hash {
-                    indices.push(i as u32);
-                    count += 1;
+            match group_positions.get(&hash) {
+                Some(&group) => groups[group].1.push(i as u32),
+                None => {
+                    group_positions.insert(hash, groups.len());
+                    groups.push((hash, vec![i as u32]));
                 }
             }
+        }
 
-            info.count = count;
+        // Determine the order in which the type groups are laid out in
+        // `resource_indices`: types that already existed in the previous
+        // file keep the relative order of their previous bundle entries;
+        // new types are appended afterwards, ascending by type hash, so
+        // the layout is deterministic.
+        let mut group_order: Vec<Hash32> = Vec::new();
+
+        if let Some(previous) = previous {
+            let mut previous_bundles: Vec<(&Hash32, &ResourceBundleEntry)> =
+                previous.resource_bundles.iter().collect();
+            previous_bundles.sort_by_key(|(_, entry)| entry.index);
+
+            for (hash, _) in previous_bundles {
+                if group_positions.contains_key(hash) {
+                    group_order.push(*hash);
+                }
+            }
+        }
+
+        let mut new_types: Vec<Hash32> = groups
+            .iter()
+            .map(|(hash, _)| *hash)
+            .filter(|hash| !group_order.contains(hash))
+            .collect();
+        new_types.sort_unstable();
+        group_order.extend(new_types);
+
+        // Assign the bundle entries in group order.
+        let mut indices = Vec::with_capacity(self.resources.len());
+        let mut bundles = StaticMapBuilder::default();
+
+        for hash in &group_order {
+            let internal_hash = type_registry.get_by_hash(LookupKey::Qualified(*hash))
+                .map(|info| info.internal_hash)
+                .or_else(|| internal_hash_fallback
+                    .and_then(|map| map.get(hash))
+                    .map(|entry| entry.internal_hash))
+                .ok_or(KFCWriteError::UnknownTypeHash(*hash))?;
+
+            let group = &groups[group_positions[hash]].1;
+
+            bundles.insert(*hash, ResourceBundleEntry {
+                internal_hash,
+                index: indices.len(),
+                count: group.len(),
+            });
+
+            indices.extend_from_slice(group);
         }
 
         self.resource_indices = indices;
-        self.resource_bundles = type_hashes.into_iter().collect::<HashMap<_, _>>().into();
+        self.resource_bundles = bundles.build();
 
         Ok(())
     }
