@@ -2,6 +2,8 @@
 
 use std::{cmp::{Eq, Ord}, collections::HashMap, hash::Hash, io::{Read, Write}};
 
+use indexmap::IndexMap;
+
 use crate::io::{ReadExt, WriteExt};
 
 use super::StaticMapError;
@@ -153,9 +155,18 @@ impl StaticMapBucket {
 
 }
 
+/// Builder for a [`StaticMap`].
+///
+/// Entries are stored in an [`IndexMap`], so insertion order is preserved.
+/// [`StaticMapBuilder::build`] groups entries by bucket with a *stable*
+/// sort, which means the relative order of entries within one bucket is
+/// exactly the order in which they were inserted. A builder created from a
+/// loaded [`StaticMap`] (see `as_builder` / `into_builder`) therefore
+/// reproduces the loaded file's key order on write, instead of the
+/// arbitrary iteration order a plain `HashMap` would produce.
 #[derive(Debug, Clone, Default)]
 pub struct StaticMapBuilder<K, V> {
-    entries: HashMap<K, V>,
+    entries: IndexMap<K, V>,
 }
 
 impl<K: Eq + Hash + Ord + StaticHash, V> StaticMapBuilder<K, V> {
@@ -195,6 +206,8 @@ impl<K: Eq + Hash + Ord + StaticHash, V> StaticMapBuilder<K, V> {
         let mut buckets = vec![StaticMapBucket::default(); bucket_size];
 
         let mut entries = self.entries.into_iter().collect::<Vec<_>>();
+        // `sort_by_key` is stable: entries that fall into the same bucket
+        // keep their insertion order (see the type-level docs).
         entries.sort_by_key(|(k, _)| k.static_hash() % bucket_size as u32);
 
         let mut bucket_index = 0;
@@ -228,7 +241,7 @@ impl<K: Eq + Hash + Ord + StaticHash, V> From<HashMap<K, V>> for StaticMap<K, V>
     #[inline]
     fn from(map: HashMap<K, V>) -> Self {
         StaticMapBuilder {
-            entries: map,
+            entries: map.into_iter().collect(),
         }.build()
     }
 
@@ -320,6 +333,31 @@ mod tests {
         let result = StaticMap::from_parts(vec![1u32], vec!["one"], buckets);
 
         assert!(matches!(result, Err(StaticMapError::BucketOutOfRange(usize::MAX, 1, 1))));
+    }
+
+    #[test]
+    fn test_static_map_builder_preserves_within_bucket_order() {
+        // u32 keys hash to themselves; with 4 entries the bucket size is 4,
+        // so 5, 1 and 9 share bucket 1 and 3 lands in bucket 3. The build
+        // must keep the insertion order inside bucket 1 (a HashMap-backed
+        // builder made this order arbitrary).
+        let mut builder = StaticMapBuilder::default();
+        builder.insert(5u32, "five");
+        builder.insert(1u32, "one");
+        builder.insert(9u32, "nine");
+        builder.insert(3u32, "three");
+
+        let map = builder.build();
+        assert_eq!(map.keys(), &[5, 1, 9, 3]);
+
+        // A builder taken from a loaded map reproduces the loaded order.
+        let rebuilt = map.as_builder().build();
+        assert_eq!(rebuilt.keys(), map.keys());
+        assert_eq!(rebuilt.values(), map.values());
+        assert_eq!(rebuilt.buckets().len(), map.buckets().len());
+        for (a, b) in rebuilt.buckets().iter().zip(map.buckets()) {
+            assert_eq!((a.index, a.count), (b.index, b.count));
+        }
     }
 
 }

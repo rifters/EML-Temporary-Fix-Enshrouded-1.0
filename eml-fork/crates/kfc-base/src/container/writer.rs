@@ -361,7 +361,12 @@ where
     }
 
     pub fn finalize(mut self) -> Result<(), KFCWriteError> {
-        self.submit_resource_data()?;
+        // Only submit a trailing chunk when resource data is actually
+        // pending. Submitting unconditionally would append an empty chunk
+        // (and grow the resources stream) even for a zero-change write.
+        if !self.chunk_writer.get_ref().is_empty() {
+            self.submit_resource_data()?;
+        }
 
         // prepare container infos
 
@@ -422,12 +427,22 @@ where
         file.set_magic(magic);
 
         file.set_game_version(self.game_version);
-        file.set_resources(
-            self.resources.build(),
-            self.type_registry.borrow(),
-            self.incremental_data.as_ref()
-                .map(|data| data.reference_file.borrow().resource_bundles())
-        )?;
+        match self.incremental_data.as_ref()
+            .map(|data| data.reference_file.borrow())
+        {
+            // Incremental writes preserve the reference file's bundle
+            // layout wherever the resource set allows it.
+            Some(reference) => file.set_resources_preserving_bundles(
+                self.resources.build(),
+                self.type_registry.borrow(),
+                reference,
+            )?,
+            None => file.set_resources(
+                self.resources.build(),
+                self.type_registry.borrow(),
+                None,
+            )?,
+        }
         file.set_contents(self.contents.build());
         file.set_containers(containers);
         file.set_resource_chunks(chunks);
