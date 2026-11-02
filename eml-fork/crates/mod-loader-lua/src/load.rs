@@ -60,6 +60,7 @@ pub fn create_writer(
         type_registry.clone(),
         KFCWriteOptions {
             overwrite_containers: true,
+            in_place: true,
             ..Default::default()
         }
     ) {
