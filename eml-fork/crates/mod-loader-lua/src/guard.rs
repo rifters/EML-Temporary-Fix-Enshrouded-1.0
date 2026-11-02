@@ -3,9 +3,10 @@
 //! The game refuses to start ("Could not find core resource package") when
 //! `enshrouded.kfc` is damaged or points outside `enshrouded.kfc_resources`.
 //! That can happen when a patch is cut half way (crash, antivirus lock, power loss)
-//! or when it ends in a file the game cannot read. Original data is never
-//! overwritten (patches are appended), so putting the untouched `.kfc.bak`
-//! back is always enough to get a working game again.
+//! or when it ends in a file the game cannot read. The backup is a pair
+//! (`.kfc.bak` + `.kfc_resources.bak`): with append-only exports the `.kfc`
+//! alone used to be enough, but the in-place writer rewrites stream data,
+//! so the two halves are always restored together.
 
 use std::{fs, path::Path};
 
@@ -69,7 +70,7 @@ pub fn verify(game_dir: &Path, file_name: &str) -> Result<(), String> {
 }
 
 fn restore_original(game_dir: &Path, file_name: &str) -> bool {
-    let (kfc, bak, _) = paths(game_dir, file_name);
+    let (kfc, bak, res) = paths(game_dir, file_name);
     if KFCFile::get_version_tag(&bak).is_err() {
         warn!(path = ?bak, "No usable .kfc.bak to restore");
         return false;
@@ -77,6 +78,20 @@ fn restore_original(game_dir: &Path, file_name: &str) -> bool {
     match fs::copy(&bak, &kfc) {
         Ok(_) => {
             info!(path = ?kfc, "Original enshrouded.kfc restored from backup");
+
+            // Restore the resources half of the pair as well, when one
+            // was backed up. A .kfc restored on its own points into a
+            // stream from another generation and the game refuses it.
+            let res_bak = game_dir.join(format!("{file_name}.kfc_resources.bak"));
+
+            if res_bak.is_file() {
+                if let Err(e) = fs::copy(res_bak, &res) {
+                    error!(error = %e, "Failed to restore original enshrouded.kfc_resources");
+                    return false;
+                }
+                info!(path = ?res, "Original enshrouded.kfc_resources restored from backup");
+            }
+
             true
         }
         Err(e) => {
