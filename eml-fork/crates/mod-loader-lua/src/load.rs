@@ -31,6 +31,14 @@ pub fn create_reader(
         file_name,
         KFCReaderOptions {
             kfc_extension: "kfc.bak",
+            // The backup is a pair (see create_backup): the .bak directory
+            // must read its data from the backup stream, not the live one.
+            // Pairing it with the live stream returns whatever a later
+            // export left at the base offsets - with append-only exports
+            // that happened to be the original data, but the in-place
+            // writer rewrites those slots, and base reads then hand mods
+            // foreign bytes that panic the reflection layer.
+            resource_extension: "kfc_resources.bak",
             ..Default::default()
         }
     ).and_then(|reader| reader.into_cursor()) {
