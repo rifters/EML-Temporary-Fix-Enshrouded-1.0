@@ -388,11 +388,64 @@ impl ResourceEntry {
     #[inline]
     pub fn write<W: Write + Seek>(&self, writer: &mut W) -> Result<(), KFCWriteError> {
         writer.write_u32(self.offset as u32)?;
-        writer.write_u32(self.size as u32)?;
+        // The game stores resource sizes in 24 bits: a size of 16 MiB or
+        // larger is truncated to its lower 24 bits, and the reader
+        // recovers the actual size from the neighbouring offsets (see
+        // `KFCReader::resource_size`). Truncate here as well, so a size
+        // that was re-derived from the actual data (e.g. by
+        // `KFCWriter::write_resource`, which records the true byte count)
+        // serializes exactly like the game's own writer wrote it:
+        // 44,659,852 & 0xFF_FFFF = 11,105,420.
+        writer.write_u32(self.size as u32 & 0x00FF_FFFF)?;
 
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    fn write_entry(entry: &ResourceEntry) -> Vec<u8> {
+        let mut buffer = Cursor::new(Vec::new());
+        entry.write(&mut buffer).unwrap();
+        buffer.into_inner()
+    }
+
+    #[test]
+    fn resource_entry_write_truncates_size_to_24_bits() {
+        // The one resource in the build-1273043 container whose size
+        // exceeds 24 bits: stored by the game as 11,105,420, actual
+        // 44,659,852 bytes.
+        assert_eq!(44_659_852 & 0x00FF_FFFF, 11_105_420);
+
+        let bytes = write_entry(&ResourceEntry::new(25_175_536, 44_659_852));
+        assert_eq!(
+            bytes,
+            [
+                25_175_536u32.to_le_bytes(),
+                11_105_420u32.to_le_bytes()
+            ]
+            .concat()
+        );
+
+        // Exactly 16 MiB truncates to zero, one byte less is kept whole.
+        let bytes = write_entry(&ResourceEntry::new(0, 0x100_0000));
+        assert_eq!(&bytes[4..], 0u32.to_le_bytes());
+        let bytes = write_entry(&ResourceEntry::new(0, 0xFF_FFFF));
+        assert_eq!(&bytes[4..], 0xFF_FFFFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn resource_entry_write_keeps_small_sizes() {
+        for size in [0, 1, 9_376, 1_048_576] {
+            let bytes = write_entry(&ResourceEntry::new(16, size));
+            assert_eq!(&bytes[4..], (size as u32).to_le_bytes());
+        }
+    }
 }
 
 /// # Layout
