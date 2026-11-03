@@ -169,6 +169,25 @@ impl App {
         self.spawners.iter().any(|s| !s.pool.is_empty() && !s.once)
     }
 
+    fn has_raids(&self) -> bool {
+        self.spawners.iter().any(|s| s.once || !s.pool.is_empty())
+    }
+
+    /// Removes every raid (automatic ones and one-off ones) from the list and from the server.
+    fn stop_all_raids(&mut self) {
+        let ids: Vec<String> = self.spawners.iter().filter(|s| s.once || !s.pool.is_empty()).map(|s| s.id.clone()).collect();
+        if ids.is_empty() {
+            self.ev.notice = "No hay raids que detener.".to_string();
+            return;
+        }
+        self.spawners.retain(|s| !ids.contains(&s.id));
+        self.ev.unapplied = false;
+        self.ev.notice = match spawners::save_change(&self.dir, &self.spawners, &spawners::op_delete_many(&ids)) {
+            Ok(()) => format!("{} raid(s) detenidos y borrados del servidor.", ids.len()),
+            Err(e) => format!("Error: {e}"),
+        };
+    }
+
     fn activate_auto(&mut self) {
         let list: Vec<RaidTemplate> = self.ready_templates().into_iter().filter(|t| t.active).collect();
         if list.is_empty() {
@@ -198,6 +217,20 @@ impl App {
     /// Sends the edited templates to the automatic raids that are already running.
     fn apply_to_active(&mut self) {
         let list: Vec<RaidTemplate> = self.ready_templates().into_iter().filter(|t| t.active).collect();
+        if list.is_empty() {
+            let ids: Vec<String> = self.spawners.iter().filter(|s| !s.pool.is_empty() && !s.once).map(|s| s.id.clone()).collect();
+            if ids.is_empty() {
+                self.ev.notice = "No hay raids automáticos activos.".to_string();
+                return;
+            }
+            self.spawners.retain(|s| !ids.contains(&s.id));
+            self.ev.unapplied = false;
+            self.ev.notice = match spawners::save_change(&self.dir, &self.spawners, &spawners::op_delete_many(&ids)) {
+                Ok(()) => format!("No quedan plantillas automáticas: {} raid(s) automáticos detenidos.", ids.len()),
+                Err(e) => format!("Error: {e}"),
+            };
+            return;
+        }
         let mut wave = Vec::new();
         for s in self.spawners.iter().filter(|s| !s.pool.is_empty() && !s.once) {
             let mut s = s.clone();
@@ -519,13 +552,18 @@ impl App {
         if button(ui, "ACTIVAR RAIDS AUTOMÁTICOS EN LAS ZONAS ELEGIDAS", Vec2::new(ui.available_width(), 44.0), usable && !self.ev.zones.is_empty(), true) {
             *action = Some(Action::Activate);
         }
+        if self.has_raids() {
+            if button(ui, "DETENER TODOS LOS RAIDS", Vec2::new(ui.available_width(), 36.0), true, false) {
+                self.stop_all_raids();
+            }
+        }
         if self.has_automatic() {
             let label = if self.ev.unapplied { "APLICAR LOS CAMBIOS A LOS RAIDS ACTIVOS (hay cambios sin aplicar)" } else { "Aplicar los cambios a los raids activos" };
             if button(ui, label, Vec2::new(ui.available_width(), 36.0), true, self.ev.unapplied) {
                 *action = Some(Action::Apply);
             }
         }
-        ui.label(RichText::new("Cada raid elige una plantilla al azar y la pone en un punto al azar dentro del radio de la zona, si hay un jugador a menos de 150 m. «Lanzar ahora» (en cada plantilla) la envía enseguida a las zonas elegidas. Los automáticos se quitan desde la lista de apariciones de la pestaña Criaturas.").color(MUTED).size(14.0));
+        ui.label(RichText::new("Cada raid elige una plantilla al azar y la pone en un punto al azar dentro del radio de la zona, si hay un jugador a menos de 150 m. «Lanzar ahora» (en cada plantilla) la envía enseguida a las zonas elegidas. Borrar o desmarcar una plantilla no detiene los raids que ya están activos: pulsa «Aplicar los cambios» o «Detener todos los raids».").color(MUTED).size(14.0));
         if !self.ev.notice.is_empty() {
             ui.label(RichText::new(self.ev.notice.clone()).color(GOOD).size(15.0));
         }

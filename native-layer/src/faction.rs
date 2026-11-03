@@ -16,6 +16,16 @@ static ZONE_PVP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// player-group faction that never counts as a hostile player pair.
 pub const PEACE: u8 = 8;
 
+/// Mask bit to publish for a faction value lent to a player. `PEACE` shares its value with the
+/// first team faction, so it is a team only while no always-PvP zone is in use.
+pub fn mask_bit(wanted: u8, zone_mode: bool) -> u32 {
+    if wanted == PLAYER || (zone_mode && wanted == PEACE) {
+        0
+    } else {
+        1u32 << wanted
+    }
+}
+
 /// At least one always-PvP zone exists and PvP is off for the rest of the world.
 pub fn set_zone_pvp(on: bool) {
     ZONE_PVP.store(on, Ordering::Relaxed);
@@ -34,6 +44,17 @@ static FRIENDLY_FIRE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Members of the same team can hurt each other (off by default: teams protect their members).
 pub fn set_friendly_fire(on: bool) {
     FRIENDLY_FIRE.store(on, Ordering::Relaxed);
+}
+
+static FRIENDLY_FIRE_SETTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The friendly fire option as saved, even while PvP is off elsewhere (always-PvP zones need it).
+pub fn set_friendly_fire_setting(on: bool) {
+    FRIENDLY_FIRE_SETTING.store(on, Ordering::Relaxed);
+}
+
+pub fn friendly_fire_setting() -> bool {
+    FRIENDLY_FIRE_SETTING.load(Ordering::Relaxed)
 }
 
 pub fn friendly_fire() -> bool {
@@ -270,6 +291,18 @@ mod tests {
         assert!(!enemy(8, PLAYER, true));
         // monsters still hostile to players
         assert!(enemy(4, PLAYER, true));
+    }
+
+    #[test]
+    fn the_first_team_faction_is_published_outside_zone_mode() {
+        assert_eq!(mask_bit(8, false), 1 << 8);
+        assert_eq!(mask_bit(11, false), 1 << 11);
+        assert_eq!(mask_bit(8, true), 0);
+        assert_eq!(mask_bit(11, true), 1 << 11);
+        assert_eq!(mask_bit(PLAYER, false), 0);
+        let mask = mask_bit(8, false);
+        assert!(enemy_in(8, PLAYER, true, mask));
+        assert!(!enemy_in(8, 8, true, mask));
     }
 
     #[test]

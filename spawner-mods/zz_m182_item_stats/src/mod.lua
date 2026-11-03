@@ -22,9 +22,16 @@ for _, o in pairs(OVERRIDES) do
 end
 local FREE_SKILLS = BALANCE["freeSkills"] == 1
 BALANCE["freeSkills"] = nil
+local STACK = tonumber(BALANCE["stackFactor"]) or 1
+local ALTAR = tonumber(BALANCE["altarFactor"]) or 1
+BALANCE["stackFactor"] = nil
+BALANCE["altarFactor"] = nil
+if STACK < 1 then STACK = 1 end
+if ALTAR < 1 then ALTAR = 1 end
 local WIDEN = tonumber(BALANCE["itemLevelCap"]) or 0
 if WIDEN <= 55 then WIDEN = 0 end
-if next(OVERRIDES) == nil and next(LEVELS) == nil and next(BALANCE) == nil and not FREE_SKILLS and WIDEN == 0 then
+print(string.format("[m182-item-stats] data: itemLevelCap=%s playerLevelCap=%s stackFactor=%s altarFactor=%s", tostring(BALANCE["itemLevelCap"]), tostring(BALANCE["playerLevelCap"]), tostring(STACK), tostring(ALTAR)))
+if next(OVERRIDES) == nil and next(LEVELS) == nil and next(BALANCE) == nil and not FREE_SKILLS and WIDEN == 0 and STACK == 1 and ALTAR == 1 then
     print("[m182-item-stats] no item settings saved, nothing to apply")
     do return end
 end
@@ -63,6 +70,12 @@ end
 
 local applied, failed = 0, 0
 print("[m182-item-stats] start")
+
+local function join(t, n)
+    local out = {}
+    for i = 1, n do out[i] = tostring(t[i]) end
+    return table.concat(out, ",")
+end
 
 local function unsigned(id)
     if type(id) ~= "number" then return nil end
@@ -106,6 +119,7 @@ end
 local found = {}
 local levelsDone = {}
 local widened = 0
+local stacked = 0
 local items = try(function() return game.assets.get_resources_by_type("keen::ItemInfo") end)
 if items ~= nil then
     pcall(function()
@@ -114,6 +128,13 @@ if items ~= nil then
                 local data = resource.data
                 local id = unsigned(hash_of(data.itemId))
                 local range = id and LEVELS[id]
+                if STACK > 1 then
+                    local ms = try(function() return data.maxStackSize end)
+                    if type(ms) == "number" and ms > 1 then
+                        local want = math.min(65535, math.floor(ms * STACK + 0.5))
+                        if want > ms and put(data, "maxStackSize", want) then stacked = stacked + 1 end
+                    end
+                end
                 if WIDEN > 0 then
                     local wspan = try(function() return data.itemLevelRange end)
                     local wlo = try(function() return wspan.minLevel end)
@@ -158,7 +179,7 @@ for id in pairs(LEVELS) do
     if levelsDone[id] == nil then print(string.format("[m182-item-stats] item %d (level range) not found in the game data", id)) end
 end
 
-print(string.format("[m182-item-stats] items done applied=%d failed=%d widened=%d", applied, failed, widened))
+print(string.format("[m182-item-stats] items done applied=%d failed=%d widened=%d stacked=%d", applied, failed, widened, stacked))
 
 if FREE_SKILLS then
     local nodes, freed = 0, 0
@@ -179,6 +200,24 @@ end
 local tables = try(function() return game.assets.get_resources_by_type("keen::BalancingTable") end)
 if type(tables) == "table" and #tables > 0 then
     local d = tables[1].data
+    if ALTAR > 1 then
+        local list = try(function() return d.altarsPerFlameLevel end)
+        local before, after = {}, {}
+        if list ~= nil then
+            local count = 0
+            for i, v in ipairs(list) do
+                count = count + 1
+                before[i] = v
+                if type(v) == "number" and v > 0 then
+                    put(list, i, math.min(255, math.floor(v * ALTAR + 0.5)))
+                end
+                after[i] = try(function() return list[i] end)
+            end
+            print(string.format("[m182-item-stats] altars per flame level: %d entries, before {%s} after {%s}", count, join(before, count), join(after, count)))
+        else
+            print("[m182-item-stats] altars per flame level: field not found")
+        end
+    end
     for key, value in pairs(BALANCE) do
         local rarity = string.match(key, "^rarityDurabilityMod%.(%a+)$")
         local ok

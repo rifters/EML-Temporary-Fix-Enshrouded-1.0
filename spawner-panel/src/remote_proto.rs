@@ -113,11 +113,6 @@ pub fn pvp(key: &str, on: bool) -> String {
     format!("{PREFIX} {key} pvp {}", if on { "on" } else { "off" })
 }
 
-pub fn mark(key: &str, text: &str) -> String {
-    let clean: String = text.chars().filter(|c| !c.is_control()).take(60).collect();
-    format!("{PREFIX} {key} mark {}", clean.trim())
-}
-
 pub fn friendly_fire(key: &str, on: bool) -> String {
     format!("{PREFIX} {key} friendlyfire {}", if on { "on" } else { "off" })
 }
@@ -189,7 +184,6 @@ mod tests {
     fn small_commands() {
         assert_eq!(pvp("abcdefg", true), "!m182 abcdefg pvp on");
         assert_eq!(pvp("abcdefg", false), "!m182 abcdefg pvp off");
-        assert_eq!(mark("abcdefg", " door test\n"), "!m182 abcdefg mark door test");
         assert_eq!(friendly_fire("abcdefg", true), "!m182 abcdefg friendlyfire on");
         assert_eq!(friendly_fire("abcdefg", false), "!m182 abcdefg friendlyfire off");
         assert_eq!(ping("abcdefg"), "!m182 abcdefg ping");

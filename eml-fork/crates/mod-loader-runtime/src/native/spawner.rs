@@ -523,6 +523,30 @@ struct Request {
     stats: Option<StatsPatch>,
 }
 
+static DROP_FACTOR: OnceLock<f64> = OnceLock::new();
+
+fn server_drop_factor() -> f64 {
+    *DROP_FACTOR.get_or_init(|| {
+        let factor = std::env::current_dir()
+            .ok()
+            .and_then(|d| std::fs::read_to_string(d.join("enshrouded_server.json")).ok())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v["gameSettings"]["resourceDropStackAmountFactor"].as_f64())
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .unwrap_or(1.0);
+        log(&format!("loot: the server multiplies picked-up stacks by {factor}; configured amounts are divided by it"));
+        factor
+    })
+}
+
+fn compensated_amount(amount: u32) -> u32 {
+    let f = server_drop_factor();
+    if (f - 1.0).abs() < 1e-6 {
+        return amount.clamp(1, 65535);
+    }
+    ((amount as f64 / f).round() as u32).clamp(1, 65535)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GiveSpec {
     pub item: u32,
@@ -1261,6 +1285,16 @@ fn component_data(entries: &[u8], count: usize, hash: u32, size: usize) -> Optio
     None
 }
 
+pub fn tick() {
+    if PENDING.load(Ordering::Relaxed) == 0 && AURA_PENDING.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let manager = SERVER_MGR.load(Ordering::Relaxed);
+    if manager != 0 {
+        before(manager, 1);
+    }
+}
+
 pub fn before(manager: usize, edx: u32) {
     if PENDING.load(Ordering::Relaxed) == 0 && AURA_PENDING.load(Ordering::Relaxed) == 0 && !super::vfx::pending() {
         return;
@@ -1768,7 +1802,7 @@ fn spawn_now(manager: usize) {
         let angle = std::f64::consts::TAU * k as f64 / settings.count as f64;
         let dx = (radius * angle.cos() * METERS) as i64;
         let dz = (radius * angle.sin() * METERS) as i64;
-        let dy = (0.5 * METERS) as i64;
+        let dy = if delivery { 0 } else { (0.5 * METERS) as i64 };
 
         let mut transform = [0u8; TRANSFORM_SIZE];
         write_u64(&mut transform, 0, base.0.wrapping_add(dx) as u64);
@@ -1816,7 +1850,7 @@ fn spawn_now(manager: usize) {
             pickup[4..20].copy_from_slice(&g.guid);
             pickup[20..24].copy_from_slice(&g.level.to_le_bytes());
             pickup[24] = g.rarity as u8;
-            pickup[26..28].copy_from_slice(&(g.amount as u16).to_le_bytes());
+            pickup[26..28].copy_from_slice(&(compensated_amount(g.amount) as u16).to_le_bytes());
             write_u32(&mut entries.0, 24, HASH_PICKUP_ITEM);
             write_u64(&mut entries.0, 32, pickup.as_ptr() as u64);
             write_u64(&mut entries.0, 40, PICKUP_ITEM_SIZE as u64);
@@ -2471,7 +2505,7 @@ fn lend_faction(addr: usize, value: u8) -> bool {
 
 fn team_factions(present: &[usize], pvp: bool) -> Vec<u8> {
     let mut by_team: Vec<u8> = vec![super::faction::PLAYER; present.len()];
-    if !pvp {
+    if !pvp || super::faction::friendly_fire_setting() {
         return by_team;
     }
     let mut next = 0usize;
@@ -2489,6 +2523,9 @@ fn team_factions(present: &[usize], pvp: bool) -> Vec<u8> {
 /// (`PEACE`) is never lent to a team.
 fn zone_team_factions(present: &[usize]) -> Vec<u8> {
     let mut by_team: Vec<u8> = vec![super::faction::PLAYER; present.len()];
+    if super::faction::friendly_fire_setting() {
+        return by_team;
+    }
     if let Some(index) = present.iter().position(|n| *n >= 2) {
         by_team[index] = super::faction::TEAM_FACTIONS[1];
     }
@@ -2654,9 +2691,7 @@ fn groups_tick(st: &mut PowerState, dir: &std::path::Path) {
                         map.push((addr, team));
                     }
                     if lend_faction(addr, wanted) {
-                        if wanted != super::faction::PLAYER && wanted != super::faction::PEACE {
-                            mask |= 1u32 << wanted;
-                        }
+                        mask |= super::faction::mask_bit(wanted, zone_mode);
                     } else {
                         log(&format!("teams: could not set the faction of entity {id}"));
                     }
@@ -3286,7 +3321,21 @@ pub fn new_power_state() -> PowerState {
 }
 
 
+fn watch_collection(manager: usize, id: u32, item: u32) {
+    let _ = std::thread::Builder::new().name("m182-pickup-watch".into()).spawn(move || {
+        for second in 1..=6u32 {
+            std::thread::sleep(Duration::from_secs(1));
+            if find_record(manager, id).is_none() {
+                log(&format!("delivery: item {item} was collected after {second} s (the pickup entity {id} is gone)"));
+                return;
+            }
+        }
+        log(&format!("delivery: item {item} is still on the ground after 6 s (the pickup entity {id} was not collected)"));
+    });
+}
+
 fn verify_pickup(manager: usize, id: u32, g: &GiveSpec) {
+    watch_collection(manager, id, g.item);
     let Some((_, _, slots)) = entity_layout(manager, id) else {
         log(&format!("delivery: entity {id} not readable"));
         return;

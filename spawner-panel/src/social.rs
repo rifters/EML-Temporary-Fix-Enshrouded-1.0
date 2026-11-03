@@ -765,6 +765,9 @@ impl App {
         divider(ui);
         let mut changed = false;
         let mut remove = None;
+        if self.pvp && self.social.zones.iter().any(|z| z.pvp) {
+            ui.label(RichText::new("El PvP está activado en todo el mundo (pestaña PvP). Apágalo ahí para que las zonas de PvP siempre activo se noten.").color(GOLD));
+        }
         let team_names: Vec<String> = self.social.teams.iter().map(|t| t.name.clone()).collect();
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, z) in self.social.zones.iter_mut().enumerate() {
@@ -780,13 +783,18 @@ impl App {
                         }
                     });
                     ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(!z.pvp, egui::Checkbox::new(&mut z.safe, "Zona segura (nadie pierde vida)")).changed() {
-                            changed = true;
-                        }
-                        if ui.checkbox(&mut z.pvp, "PvP siempre activo aquí").on_hover_text("Dentro de esta zona los jugadores se pueden atacar entre sí aunque el PvP esté apagado en el resto del mundo. No puede ser zona segura.").changed() {
-                            if z.pvp {
-                                z.safe = false;
+                        ui.label("Combate en la zona");
+                        let mode = if z.pvp { 2 } else if z.safe { 1 } else { 0 };
+                        let names = ["Según la pestaña PvP", "Zona segura (nadie pierde vida)", "PvP siempre activo"];
+                        let mut picked = mode;
+                        egui::ComboBox::from_id_salt(("zone_combat", i)).selected_text(names[mode]).show_ui(ui, |ui| {
+                            for (n, name) in names.iter().enumerate() {
+                                ui.selectable_value(&mut picked, n, *name);
                             }
+                        });
+                        if picked != mode {
+                            z.safe = picked == 1;
+                            z.pvp = picked == 2;
                             changed = true;
                         }
                         ui.label("Equipo dueño");
@@ -831,14 +839,8 @@ impl App {
     pub fn teams_tab(&mut self, ui: &mut egui::Ui) {
         heading(ui, "Equipos", 22.0);
         divider(ui);
-        let mut pvp_changed = false;
-        pvp_changed |= ui.checkbox(&mut self.pvp, "PvP activo (necesario para que los equipos tengan efecto)").changed();
-        if pvp_changed {
-            self.notice = match self.set_config(&[("pvp", json!(self.pvp)), ("pvp_friend_checks", json!(self.pvp && self.pvp_friends))]) {
-                Ok(()) => "PvP guardado.".to_string(),
-                Err(e) => format!("Error: {e}"),
-            };
-        }
+        let state = if self.pvp { "activado" } else { "desactivado" };
+        ui.label(RichText::new(format!("PvP: {state}. Se cambia en la pestaña PvP.")).color(MUTED));
         divider(ui);
         label_title(ui, "JUGADORES CONECTADOS");
         if self.social.seen.is_empty() {

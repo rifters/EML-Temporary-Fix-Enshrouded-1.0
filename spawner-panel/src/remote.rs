@@ -73,6 +73,17 @@ struct State {
     status: Status,
 }
 
+static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(!cfg!(test));
+
+/// While held, nothing queued is typed into the server.
+pub fn hold(on: bool) {
+    HELD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn held() -> bool {
+    HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static FORCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn forced() -> bool {
@@ -299,6 +310,11 @@ pub fn forget_one(file: &str) {
     }
 }
 
+/// Drops the in-memory record so it is read again from disk (used when the profile changes).
+pub fn reload_sent() {
+    *SENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Forgets what the server is known to have, so the next submit of every file is sent again.
 pub fn forget_sent() {
     sent_map(|m| m.clear());
@@ -350,11 +366,6 @@ pub fn submit_friendly_fire(on: bool) {
     push(Job { file: "friendlyfire".to_string(), lines: vec![proto::friendly_fire(&key, on)], tries: 0, sum: None }, true);
 }
 
-pub fn submit_mark(text: &str) {
-    let key = state().settings.key.clone();
-    push(Job { file: "mark".to_string(), lines: vec![proto::mark(&key, text)], tries: 0, sum: None }, false);
-}
-
 pub fn submit_players(seq: u32) {
     let key = state().settings.key.clone();
     push(Job { file: "players".to_string(), lines: vec![proto::players(&key, seq)], tries: 0, sum: None }, true);
@@ -389,6 +400,9 @@ const RETRY_PAUSE: Duration = Duration::from_millis(1500);
 fn worker() {
     loop {
         std::thread::sleep(Duration::from_millis(150));
+        if held() {
+            continue;
+        }
         let (job, typist) = {
             let mut s = state();
             if s.queue.is_empty() || s.typist.is_none() {
@@ -458,6 +472,7 @@ pub fn reset_for_tests() {
     s.hosting = None;
     s.settings = Settings { enabled: false, key: String::new(), limit: DEFAULT_LIMIT };
     s.status = Status::default();
+    HELD.store(false, std::sync::atomic::Ordering::Relaxed);
     *SENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Default::default());
 }
 

@@ -7,6 +7,7 @@ mod events;
 mod icons;
 mod items;
 mod powers;
+pub mod profile;
 pub mod remote;
 mod server;
 pub mod remote_proto;
@@ -120,6 +121,10 @@ enum Status {
 }
 
 pub struct App {
+    profiles: Vec<String>,
+    profile: String,
+    profile_new: String,
+    profile_notice: String,
     dir: PathBuf,
     tab: Tab,
     creatures: Catalog,
@@ -150,10 +155,10 @@ pub struct App {
     player_checked: Instant,
     here: Option<(social::Here, Instant)>,
     synced: bool,
+    confirmed: bool,
     icons: HashMap<String, Option<TextureHandle>>,
     status: Status,
     notice: String,
-    diag_text: String,
     spawner_notice: String,
     creature_drops: Vec<spawners::Drop>,
     remote_cfg: remote::Settings,
@@ -504,6 +509,7 @@ impl App {
             rarity: 0,
             amount: 1,
             generic_pickup: items::load_generic_pickup(&dir),
+            direct: true,
             ..Default::default()
         };
         if let Ok(log) = std::fs::read_to_string(dir.join("m182_spawner.log")) {
@@ -561,15 +567,19 @@ impl App {
             creature_drops: Vec::new(),
             here: None,
             synced: false,
+            confirmed: false,
             places,
             new_place: String::new(),
             icons: HashMap::new(),
             status: Status::Idle,
             notice: String::new(),
-            diag_text: String::new(),
             spawner_notice: String::new(),
             remote_cfg: remote_cfg.clone(),
             remote_notice: String::new(),
+            profiles: profile::list(&dir),
+            profile: profile::active(&dir),
+            profile_new: String::new(),
+            profile_notice: String::new(),
             dir,
         };
         #[cfg(feature = "linux-preview")]
@@ -584,6 +594,48 @@ impl App {
         }
         app.cleanup_stale_request();
         app
+    }
+
+    fn profile_gate(&mut self, ui: &mut egui::Ui) {
+        if !remote::active() || self.confirmed {
+            return;
+        }
+        let mut chosen: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("PERFIL").color(BAD).size(14.5));
+            ui.label(RichText::new("Nada se envía al servidor hasta que confirmes el perfil de este servidor:").color(GOLD_DIM).size(14.5));
+            egui::ComboBox::from_id_salt("profile_gate").width(200.0).selected_text(self.profile.clone()).show_ui(ui, |ui| {
+                for name in &self.profiles {
+                    if ui.selectable_label(*name == self.profile, name).clicked() {
+                        chosen = Some(name.clone());
+                    }
+                }
+            });
+            if button(ui, "CONFIRMAR", Vec2::new(120.0, 24.0), true, true) {
+                self.confirmed = true;
+            }
+        });
+        if let Some(name) = chosen {
+            self.change_profile(&name);
+        }
+    }
+
+    fn change_profile(&mut self, name: &str) {
+        match profile::switch(&self.dir, name) {
+            Ok(active) => {
+                remote::clear_queue();
+                remote::reload_sent();
+                self.social = social::SocialState::load(&self.dir);
+                self.spawners = spawners::load(&self.dir);
+                self.places = load_places(&self.dir);
+                self.ev = events::EventState::default();
+                self.place_index = 0;
+                self.profile = active.clone();
+                self.profiles = profile::list(&self.dir);
+                self.profile_notice = format!("Perfil activo: {active}");
+            }
+            Err(e) => self.profile_notice = format!("No se pudo cambiar de perfil: {e}"),
+        }
     }
 
     fn cleanup_stale_request(&self) {
@@ -760,7 +812,7 @@ impl App {
                 request["damage"] = json!(self.damage);
             } else {
                 request["count"] = json!(1);
-                request["template"] = json!(self.items.generic_pickup.clone());
+                request["template"] = json!(if self.items.direct { items::DIRECT_PICKUP.to_string() } else { self.items.generic_pickup.clone() });
                 if let Some(item) = index_item(&self.items.rows, index) {
                     request["item"] = json!(item.id);
                     request["item_guid"] = json!(item.guid);
@@ -828,6 +880,7 @@ impl App {
                 self.social.request_roster(&dir);
             } else if !connected {
                 self.synced = false;
+                self.confirmed = false;
             }
         }
         ctx.request_repaint_after(Duration::from_millis(700));
@@ -852,7 +905,8 @@ impl App {
                 }
             }
         }
-        for op in spawners::op_replace_all(&self.spawners, 4) {
+        let standing: Vec<_> = self.spawners.iter().filter(|s| !s.once).cloned().collect();
+        for op in spawners::op_replace_all(&standing, 4) {
             if remote::submit(spawners::OP_FILE, &op).is_ok() {
                 sent += 1;
             }
@@ -869,6 +923,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.label(RichText::new("M182  ADMIN  PANEL").font(title_font(26.0)).color(GOLD));
                 self.server_strip(ui);
+                self.profile_gate(ui);
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !DONATE_URL.is_empty() && button(ui, "Paypal Donations Support", Vec2::new(250.0, 34.0), true, false) {
@@ -1333,47 +1388,13 @@ impl App {
         if !self.notice.is_empty() {
             ui.label(RichText::new(&self.notice).color(GOOD));
         }
-        ui.add_space(14.0);
-        divider(ui);
-        heading(ui, "Pruebas de diagnóstico", 18.0);
-        ui.label(RichText::new("Pulsa una marca justo antes de hacer esa acción en el juego. Así se encuentra en el registro m182_diag.log.").color(MUTED));
-        ui.horizontal_wrapped(|ui| {
-            for label in ["Construir fuera de zona", "Poner objeto", "Abrir puerta", "Abrir cofre", "Entrar en zona PvP", "Salir de zona PvP"] {
-                if button(ui, label, Vec2::new(190.0, 28.0), true, false) {
-                    self.mark_diag(label);
-                }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.diag_text).desired_width(260.0).hint_text("Otra marca"));
-            if button(ui, "Marcar", Vec2::new(100.0, 28.0), !self.diag_text.trim().is_empty(), false) {
-                let text = std::mem::take(&mut self.diag_text);
-                self.mark_diag(&text);
-            }
-        });
-    }
-
-    fn mark_diag(&mut self, text: &str) {
-        if remote::active() {
-            remote::submit_mark(text);
-            self.notice = format!("Marca enviada al servidor: {text}");
-        } else {
-            use std::io::Write;
-            let path = self.dir.join("m182_diag.log");
-            self.notice = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                Ok(mut f) => match writeln!(f, "=== MARK {}", text.trim()) {
-                    Ok(()) => format!("Marca guardada: {text}"),
-                    Err(e) => format!("Error: {e}"),
-                },
-                Err(e) => format!("Error: {e}"),
-            };
-        }
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.tick(ctx);
+        remote::hold(remote::active() && !self.confirmed);
 
         egui::TopBottomPanel::top("header")
             .frame(egui::Frame::none().fill(LEATHER).inner_margin(egui::Margin::symmetric(20.0, 12.0)).stroke(Stroke::new(1.0_f32, BRONZE)))
@@ -1448,6 +1469,10 @@ mod tests {
 
     fn app_in(dir: &Path, entries: Vec<Entry>) -> App {
         App {
+            profiles: Vec::new(),
+            profile: String::new(),
+            profile_new: String::new(),
+            profile_notice: String::new(),
             dir: dir.to_path_buf(),
             tab: Tab::Creatures,
             creatures: Catalog { entries, selected: Some(0), ..Default::default() },
@@ -1479,10 +1504,10 @@ mod tests {
             creature_drops: Vec::new(),
             here: None,
             synced: false,
+            confirmed: false,
             icons: HashMap::new(),
             status: Status::Idle,
             notice: String::new(),
-            diag_text: String::new(),
             spawner_notice: String::new(),
             remote_cfg: remote::read_settings(&std::env::temp_dir().join("m182_none")),
             remote_notice: String::new(),
@@ -1712,6 +1737,7 @@ mod tests {
         app.items.rarity = 4;
         app.items.amount = 3;
         app.items.generic_pickup = "c15a5c9d-4956-49ff-9d72-9f522229cf1c".into();
+        app.items.direct = false;
         app.target = Target::Place;
         app.spawn(Mode::Items);
         let req = read_request(&dir);
@@ -1725,6 +1751,29 @@ mod tests {
         assert!(req.get("object").is_none());
         assert!(req.get("forward").is_none());
         assert!(req.get("at").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn direct_delivery_uses_the_touch_pickup_template() {
+        let dir = temp_dir("direct_delivery");
+        let csv = "item_id,guid,debug_name,name,category,rarity,max_stack,slot,level_min,level_max,give_guid,pickup_guid,pickup_name,give_level,speed_mod,dmg_mod,cut,pierce,blunt,fire,ice,fog,lightning,healing,poison,wood,stone,metal,explosion,dmg_set,ar_physical,ar_blunt,ar_pierce,ar_cut,ar_magical,ar_fire,ar_ice,ar_fog,ar_lightning,ar_set\n\
+            55,res-2,Old_Thing,Old Thing,Materials,Common,50,,1,1,,pick-guid,LootPickup_Old,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0\n";
+        std::fs::create_dir_all(dir.join("export")).unwrap();
+        std::fs::write(dir.join("export").join("m182_items.csv"), csv).unwrap();
+        let (cat, rows) = load_item_catalog(&dir);
+        let mut app = app_in(&dir, Vec::new());
+        app.item_cat = cat;
+        app.items.rows = rows;
+        app.item_cat.selected = Some(0);
+        app.items.level = 1;
+        app.items.amount = 5;
+        app.items.direct = true;
+        app.target = Target::Place;
+        app.spawn(Mode::Items);
+        let req = read_request(&dir);
+        assert_eq!(req["template"], items::DIRECT_PICKUP);
+        assert_eq!(req["item_amount"], 5);
         let _ = std::fs::remove_dir_all(dir);
     }
 

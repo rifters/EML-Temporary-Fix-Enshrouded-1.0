@@ -395,6 +395,7 @@ unsafe extern "win64" fn stub_pump() {
 }
 
 extern "win64" fn hook_pump() {
+    super::spawner::tick();
     super::vfx::server_tick();
     super::veil_beam::tick();
 }
@@ -445,6 +446,270 @@ fn install_permissions(sections: &[&'static [u8]]) {
             super::spawner::log("permissions hooked");
         }
         Err(code) => super::spawner::log(&format!("permissions: VirtualProtect failed ({code})")),
+    }
+}
+
+pub(super) static PAY_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+static PAY_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+extern "win64" fn hook_pay_costs(context: usize, costs: usize, pay: u8) -> u8 {
+    if LIVE.free_building() {
+        if let Some(head) = super::spawn_probe::read_bytes(context, 16) {
+            if head[0] == 0 {
+                let transaction = super::spawn_probe::u64_at(&head, 8) as usize;
+                if let Some(raw) = super::spawn_probe::read_bytes(transaction + 0xe0, 4) {
+                    let owner = super::spawn_probe::u32_at(&raw, 0);
+                    let admin = super::table::entries().iter().any(|e| e.entity() == owner && super::roster::is_admin(e.permissions));
+                    if PAY_LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                        let known: Vec<u32> = super::table::entries().iter().map(|e| e.entity()).collect();
+                        super::spawner::log(&format!(
+                            "free building: payment by owner {owner} (pay={pay}) -> {} (players online {known:?})",
+                            if admin { "free, administrator" } else { "charged" }
+                        ));
+                    }
+                    if admin {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    let original = PAY_TRAMPOLINE.load(Ordering::SeqCst);
+    if original == 0 {
+        return 0;
+    }
+    let call: extern "win64" fn(usize, usize, u8) -> u8 = unsafe { std::mem::transmute(original) };
+    call(context, costs, pay)
+}
+
+fn install_pay_costs(sections: &[&'static [u8]]) {
+    let target = match find_unique(sections, &signatures::PAY_COSTS) {
+        Ok(addr) => addr,
+        Err(count) => {
+            super::spawner::log(&format!("free building off: payment function signature matched {count} times"));
+            return;
+        }
+    };
+    let page = unsafe { VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+    if page.is_null() {
+        super::spawner::log("free building off: trampoline allocation failed");
+        return;
+    }
+    let displaced = signatures::PAY_COSTS_DISPLACED;
+    unsafe {
+        std::ptr::copy_nonoverlapping(target, page, displaced);
+        let tail = page.add(displaced);
+        tail.write(0xFF);
+        tail.add(1).write(0x25);
+        tail.add(2).cast::<u32>().write_unaligned(0);
+        tail.add(6).cast::<u64>().write_unaligned(target.add(displaced) as u64);
+    }
+    PAY_TRAMPOLINE.store(page as usize, Ordering::SeqCst);
+    match unsafe { write_jump(target, hook_pay_costs as usize) } {
+        Ok(()) => super::spawner::log("free building ready: administrators build without spending materials"),
+        Err(code) => {
+            PAY_TRAMPOLINE.store(0, Ordering::SeqCst);
+            super::spawner::log(&format!("free building off: VirtualProtect failed ({code})"));
+        }
+    }
+}
+
+pub(super) static ZONES_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+static ZONES_LOGGED: AtomicU64 = AtomicU64::new(0);
+static SETTER_LOGGED: AtomicU64 = AtomicU64::new(0);
+static ZONES_AT: AtomicUsize = AtomicUsize::new(0);
+
+fn zones_offset_from_setter(code: &[u8]) -> Option<usize> {
+    let end = code.len().checked_sub(14)?;
+    (0..=end).find_map(|i| {
+        if code[i..i + 3] != [0x48, 0x8B, 0x87] || code[i + 7..i + 10] != [0x48, 0x8D, 0xB7] {
+            return None;
+        }
+        let first = u32::from_le_bytes(code[i + 3..i + 7].try_into().ok()?) as usize;
+        let second = u32::from_le_bytes(code[i + 10..i + 14].try_into().ok()?) as usize;
+        (second >= 0x1000 && first == second + 0x10).then_some(second)
+    })
+}
+
+fn add_everywhere_area(world: usize) {
+    let at = ZONES_AT.load(Ordering::Relaxed);
+    if at == 0 {
+        return;
+    }
+    let array = world + at;
+    let Some(head) = super::spawn_probe::read_bytes(array, 24) else { return };
+    let (data, count, capacity) = (super::spawn_probe::u64_at(&head, 0) as usize, super::spawn_probe::u64_at(&head, 8), super::spawn_probe::u64_at(&head, 16));
+    if data == 0 || count >= capacity || count > 4096 {
+        if ZONES_LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+            super::spawner::log(&format!("build anywhere: no room for the extra area (count {count}, capacity {capacity})"));
+        }
+        return;
+    }
+    let mut entry = [0u8; 24];
+    for (i, value) in [-1.0e6f32, -1.0e5, -1.0e6, 1.0e6, 1.0e5, 1.0e6].iter().enumerate() {
+        entry[i * 4..i * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    if count > 0 {
+        if let Some(last) = super::spawn_probe::read_bytes(data + (count as usize - 1) * 24, 24) {
+            if last == entry {
+                return;
+            }
+        }
+    }
+    if super::spawner::write_bytes(data + count as usize * 24, &entry) && super::spawner::write_bytes(array + 8, &(count + 1).to_le_bytes()) {
+        if ZONES_LOGGED.fetch_add(1, Ordering::Relaxed) < 4 {
+            super::spawner::log(&format!("build anywhere: whole-map building area added ({} areas now)", count + 1));
+        }
+    }
+}
+
+static QUERY_TRAMPOLINE: AtomicUsize = AtomicUsize::new(0);
+static QUERY_CALLS: AtomicU64 = AtomicU64::new(0);
+static QUERY_LOGGED: AtomicU64 = AtomicU64::new(0);
+
+extern "win64" fn note_query_world(world: usize) {
+    let calls = QUERY_CALLS.fetch_add(1, Ordering::Relaxed);
+    if !LIVE.client_build_anywhere() || world == 0 {
+        return;
+    }
+    if calls % 45 == 0 {
+        if QUERY_LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+            let head = super::spawn_probe::read_bytes(world + ZONES_AT.load(Ordering::Relaxed), 24).unwrap_or_default();
+            if head.len() == 24 {
+                super::spawner::log(&format!(
+                    "build anywhere: world {world:#x} has {} building areas (capacity {})",
+                    super::spawn_probe::u64_at(&head, 8),
+                    super::spawn_probe::u64_at(&head, 16)
+                ));
+            }
+        }
+        add_everywhere_area(world);
+    }
+}
+
+#[unsafe(naked)]
+unsafe extern "win64" fn stub_query() {
+    core::arch::naked_asm!(
+        "push rcx",
+        "push rdx",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "sub rsp, 0x88",
+        "movups [rsp + 0x20], xmm0",
+        "movups [rsp + 0x30], xmm1",
+        "movups [rsp + 0x40], xmm2",
+        "movups [rsp + 0x50], xmm3",
+        "movups [rsp + 0x60], xmm4",
+        "movups [rsp + 0x70], xmm5",
+        "mov rcx, rdx",
+        "call {f}",
+        "movups xmm0, [rsp + 0x20]",
+        "movups xmm1, [rsp + 0x30]",
+        "movups xmm2, [rsp + 0x40]",
+        "movups xmm3, [rsp + 0x50]",
+        "movups xmm4, [rsp + 0x60]",
+        "movups xmm5, [rsp + 0x70]",
+        "add rsp, 0x88",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdx",
+        "pop rcx",
+        "jmp qword ptr [rip + {t}]",
+        f = sym note_query_world,
+        t = sym QUERY_TRAMPOLINE,
+    );
+}
+
+fn install_build_zones_query(sections: &[&'static [u8]]) {
+    let target = match find_unique(sections, &signatures::BUILD_ZONES_QUERY) {
+        Ok(addr) => addr,
+        Err(count) => {
+            super::spawner::log(&format!("build anywhere: building-area query matched {count} times"));
+            return;
+        }
+    };
+    let page = unsafe { VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+    if page.is_null() {
+        return;
+    }
+    let displaced = signatures::BUILD_ZONES_QUERY_DISPLACED;
+    unsafe {
+        std::ptr::copy_nonoverlapping(target, page, displaced);
+        let tail = page.add(displaced);
+        tail.write(0xFF);
+        tail.add(1).write(0x25);
+        tail.add(2).cast::<u32>().write_unaligned(0);
+        tail.add(6).cast::<u64>().write_unaligned(target.add(displaced) as u64);
+    }
+    QUERY_TRAMPOLINE.store(page as usize, Ordering::SeqCst);
+    match unsafe { write_jump(target, stub_query as usize) } {
+        Ok(()) => super::spawner::log("build anywhere: area query watched"),
+        Err(code) => {
+            QUERY_TRAMPOLINE.store(0, Ordering::SeqCst);
+            super::spawner::log(&format!("build anywhere: area query VirtualProtect failed ({code})"));
+        }
+    }
+}
+
+extern "win64" fn hook_build_zones_set(world: usize, zones: usize) {
+    let original = ZONES_TRAMPOLINE.load(Ordering::SeqCst);
+    if original == 0 {
+        return;
+    }
+    let call: extern "win64" fn(usize, usize) = unsafe { std::mem::transmute(original) };
+    call(world, zones);
+    if SETTER_LOGGED.fetch_add(1, Ordering::Relaxed) < 2 {
+        super::spawner::log(&format!("build anywhere: area setter called for world {world:#x}"));
+    }
+    if LIVE.client_build_anywhere() {
+        add_everywhere_area(world);
+    }
+}
+
+fn install_build_zones(sections: &[&'static [u8]]) {
+    let client = std::env::current_exe().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n == "enshrouded.exe");
+    if !client {
+        return;
+    }
+    let target = match find_unique(sections, &signatures::BUILD_ZONES_SET) {
+        Ok(addr) => addr,
+        Err(count) => {
+            super::spawner::log(&format!("build anywhere off: building-area setter matched {count} times"));
+            return;
+        }
+    };
+    let code = unsafe { std::slice::from_raw_parts(target as *const u8, 0x120) };
+    let Some(at) = zones_offset_from_setter(code) else {
+        super::spawner::log("build anywhere off: this game version keeps its building areas somewhere unknown");
+        return;
+    };
+    ZONES_AT.store(at, Ordering::SeqCst);
+    let page = unsafe { VirtualAlloc(std::ptr::null_mut(), 0x1000, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+    if page.is_null() {
+        super::spawner::log("build anywhere off: trampoline allocation failed");
+        return;
+    }
+    let displaced = signatures::BUILD_ZONES_SET_DISPLACED;
+    unsafe {
+        std::ptr::copy_nonoverlapping(target, page, displaced);
+        let tail = page.add(displaced);
+        tail.write(0xFF);
+        tail.add(1).write(0x25);
+        tail.add(2).cast::<u32>().write_unaligned(0);
+        tail.add(6).cast::<u64>().write_unaligned(target.add(displaced) as u64);
+    }
+    install_build_zones_query(sections);
+    ZONES_TRAMPOLINE.store(page as usize, Ordering::SeqCst);
+    match unsafe { write_jump(target, hook_build_zones_set as usize) } {
+        Ok(()) => super::spawner::log("build anywhere ready: the hammer works away from altars"),
+        Err(code) => {
+            ZONES_TRAMPOLINE.store(0, Ordering::SeqCst);
+            super::spawner::log(&format!("build anywhere off: VirtualProtect failed ({code})"));
+        }
     }
 }
 
@@ -513,12 +778,18 @@ pub fn install() -> Outcome {
     }
 
     super::guard::install(&sections);
+    if super::config::LIVE.client_build_anywhere() {
+        install_build_zones(&sections);
+    }
     install_chat(&sections);
     if super::config::LIVE.spawner() || vfx || pillar {
         install_pump(&sections);
     }
     if super::config::LIVE.spawner() {
         install_permissions(&sections);
+        if super::config::LIVE.free_building() {
+            install_pay_costs(&sections);
+        }
     }
 
     let targets = [
@@ -636,5 +907,19 @@ fn executable_sections() -> Option<Vec<&'static [u8]>> {
             }
         }
         if sections.is_empty() { None } else { Some(sections) }
+    }
+}
+
+#[cfg(test)]
+mod zones_offset_tests {
+    use super::zones_offset_from_setter;
+
+    #[test]
+    fn offset_is_read_from_the_setter_code() {
+        let mut code = vec![0x90u8; 20];
+        code.extend_from_slice(&[0x48, 0x8B, 0x87, 0x78, 0x8A, 0x5F, 0x01, 0x48, 0x8D, 0xB7, 0x68, 0x8A, 0x5F, 0x01]);
+        code.extend_from_slice(&[0x90; 8]);
+        assert_eq!(zones_offset_from_setter(&code), Some(0x15F8A68));
+        assert_eq!(zones_offset_from_setter(&[0x90; 64]), None);
     }
 }

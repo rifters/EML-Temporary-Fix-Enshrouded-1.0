@@ -10,7 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const CONFIG_FILE: &str = "m182_diag.json";
 pub const LOG_FILE: &str = "m182_diag.log";
-const MAX_LOG_BYTES: u64 = 6_000_000;
+const MAX_LOG_BYTES: u64 = 12_000_000;
+const BURST_GAP: Duration = Duration::from_secs(3);
 
 static ON: AtomicBool = AtomicBool::new(false);
 static CHECKED: Mutex<Option<Instant>> = Mutex::new(None);
@@ -60,7 +61,8 @@ pub fn mark(text: &str) {
 }
 
 /// One permission lookup: who asked (entity), what the game stored and what it will see, and the
-/// address (relative to the game image) of the code that asked.
+/// address (relative to the game image) of the code that asked. Callers that ask all the time are
+/// written once; a caller that was silent for a few seconds is written again when it wakes up.
 pub fn permission(entity: u32, stored: u32, shown: u32, caller: usize) {
     let now = Instant::now();
     let Ok(mut guard) = SEEN.try_lock() else { return };
@@ -68,16 +70,18 @@ pub fn permission(entity: u32, stored: u32, shown: u32, caller: usize) {
     if map.len() > 600 {
         map.clear();
     }
-    let entry = map.entry((caller, entity, stored)).or_insert((0, now - Duration::from_secs(60)));
-    entry.0 += 1;
-    if entry.0 == 1 || now.duration_since(entry.1) >= Duration::from_secs(2) {
-        let count = entry.0;
-        entry.0 = 0;
-        entry.1 = now;
+    let entry = map.entry((caller, entity, stored)).or_insert((0, now - Duration::from_secs(3600)));
+    let quiet = now.duration_since(entry.1) >= BURST_GAP;
+    entry.1 = now;
+    if quiet {
+        let before = entry.0;
+        entry.0 = 1;
         drop(guard);
         line(&format!(
-            "perm entity={entity} stored={stored:#04x} shown={shown:#04x} caller=+{caller:#x} x{count}"
+            "perm entity={entity} stored={stored:#04x} shown={shown:#04x} caller=+{caller:#x} after={before}"
         ));
+    } else {
+        entry.0 += 1;
     }
 }
 

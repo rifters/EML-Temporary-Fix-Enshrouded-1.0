@@ -276,6 +276,10 @@ pub fn op_delete(id: &str) -> String {
     json!({ "rm": id }).to_string()
 }
 
+pub fn op_delete_many(ids: &[String]) -> String {
+    json!({ "rm": ids }).to_string()
+}
+
 /// Whole list for the server: the first message replaces what it has, the rest add to it.
 pub fn op_replace_all(list: &[Spawner], per_message: usize) -> Vec<String> {
     let rows: Vec<Value> = list.iter().map(wire_row).collect();
@@ -527,6 +531,13 @@ mod tests {
         assert!(expired(&old, 1000 + RAID_LIFETIME_MS + 1));
         assert!(!expired(&old, 1000 + 60_000));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn several_ids_go_in_one_delete() {
+        let op = op_delete_many(&["s1".to_string(), "s2".to_string()]);
+        let v: Value = serde_json::from_str(&op).unwrap();
+        assert_eq!(v["rm"], json!(["s1", "s2"]));
     }
 
     #[test]
